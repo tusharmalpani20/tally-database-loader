@@ -32,10 +32,13 @@ try {
     Copy-Item database-structure-incremental.sql $releaseDir
     Copy-Item tally-export-config.yaml $releaseDir
     Copy-Item tally-export-config-incremental.yaml $releaseDir
+    Copy-Item tally-export-config-focused-incremental.yaml $releaseDir
     Copy-Item tally-export-config.json $releaseDir
     Copy-Item docs $releaseDir -Recurse
     Copy-Item reports $releaseDir -Recurse
     Copy-Item platform $releaseDir -Recurse
+    Copy-Item tdl $releaseDir -Recurse
+    Copy-Item migrations $releaseDir -Recurse
 
     Set-Content -Path (Join-Path $releaseDir "run.bat") -Value "@echo off`r`ntallydb.exe %*`r`n" -Encoding ASCII
     Set-Content -Path (Join-Path $releaseDir "run-gui.bat") -Value "@echo off`r`ntallydb-gui.exe`r`n" -Encoding ASCII
