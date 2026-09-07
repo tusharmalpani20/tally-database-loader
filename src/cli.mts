@@ -583,12 +583,13 @@ program.command('voucher-orders')
     .description('Preview voucher order details; --apply backfills only order columns at the same source revision')
     .requiredOption('--guids <guids>', 'comma-separated list of 1–50 voucher GUIDs')
     .option('--apply', 'write revision-matched order details to PostgreSQL', false)
-    .action(async (options: { guids: string; apply: boolean }) => {
+    .option('--debug-xml', 'save private request/response XML under backfill-debug for troubleshooting', false)
+    .action(async (options: { guids: string; apply: boolean; debugXml: boolean }) => {
         const config = loadConfig();
         const errors = validateConfig(config);
         if (errors.length) throw new Error(errors.join('; '));
         const { backfillOrders } = await import('./order-backfill.mjs');
-        console.log(JSON.stringify(await backfillOrders(config, options.guids.split(',').map(value => value.trim()), options.apply), null, 2));
+        console.log(JSON.stringify(await backfillOrders(config, options.guids.split(',').map(value => value.trim()), options.apply, { debugXml: options.debugXml }), null, 2));
     });
 
 program.command('setup')

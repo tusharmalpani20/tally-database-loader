@@ -10,6 +10,8 @@ error-log.txt
 sync-status.json
 config.json
 import-metrics.jsonl
+backfill-debug/
+backfill-output*.txt
 *.xml
 !tdl/*.xml
 *.csv

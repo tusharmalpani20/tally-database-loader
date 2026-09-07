@@ -111,6 +111,39 @@ positional-COPY executable against the expanded schema. Use a column-explicit co
 build and keep Frappe imports disabled until loader/app contracts agree. Do not reset
 AlterID checkpoints or drop columns as a shortcut to historical backfill.
 
+## Manual-command diagnostics on Windows
+
+`voucher-orders` prints timestamped progress to stderr and its final JSON result to
+stdout. Progress includes schema checks, lock acquisition, the request/response sizes,
+elapsed time, response tag names and expected markers, validation and write results.
+While waiting for Tally/the request lock, a progress message appears every 15 seconds.
+Passwords and the configuration object are not printed by these diagnostics.
+
+To investigate `Missing voucher export completeness count`, use **preview** first.
+From the updated loader directory, in Windows Command Prompt:
+
+```bat
+node dist/cli.mjs voucher-orders --guids aac3341a-ee89-4145-9f7a-3edec7de877b-000f577f --debug-xml > backfill-output.txt 2>&1
+```
+
+This saves both console streams to `backfill-output.txt` (overwriting that output
+file). Add `--apply` only when you intend to perform the backfill. To see progress
+on screen and save it simultaneously, use PowerShell:
+
+```powershell
+node dist/cli.mjs voucher-orders --guids aac3341a-ee89-4145-9f7a-3edec7de877b-000f577f --debug-xml 2>&1 | Tee-Object -FilePath backfill-output.txt
+```
+
+`--debug-xml` additionally saves `request.xml` and `response.xml` inside a unique
+`backfill-debug/voucher-orders-*` directory, whose path is printed in the log.
+Responses are saved before parsing, including unexpected/error responses. These
+XML files can contain company/customer/order information; keep them private and
+review before sharing. Debug files and the suggested output filenames are ignored
+by Git. Without this option, raw XML is not saved by the backfill diagnostics.
+
+Logging does not repair the missing-count response or relax validation; a malformed
+response still stops the command before order-data writes.
+
 ## Tests
 
 `npm test` builds and runs the unit suite. The PostgreSQL integration test is opt-in
