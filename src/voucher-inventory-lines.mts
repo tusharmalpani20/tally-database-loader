@@ -2,6 +2,7 @@ import { database } from './database.mjs';
 import { logger } from './logger.mjs';
 import { tallyConfig } from './definition.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
+import { assertOrderImportLock } from './order-store.mjs';
 
 export interface voucherInventoryImportOptions {
     fromAlterId?: number;
@@ -303,6 +304,7 @@ export async function replaceVoucherInventoryRows(rows: voucherInventoryRow[], u
             );
         }
 
+        assertOrderImportLock();
         await client.query('commit');
         return rows.length;
     } catch (err) {

@@ -96,6 +96,8 @@ export interface tableFieldYAML {
 }
 
 export interface tableConfigYAML {
+    voucher_identities?: boolean;
+    order_details?: boolean;
     name: string;
     collection: string;
     nature: string;

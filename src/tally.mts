@@ -12,8 +12,9 @@ import { tallyConfig, tableConfigYAML, companyInfo, collectionConfigJSON, tableC
 import { MetricsSink, PhaseTimer } from './metrics.mjs';
 import { HttpTallyTransport, TallyTransport, tallyRequestTimeoutMs } from './tally-transport.mjs';
 import { withTallyLock } from './tally-lock.mjs';
-import { diffTableAllowList, isSkipEnabled, isSyncStripped, logActiveDiagnosticFlags } from './diagnostic-flags.mjs';
+import { activeDiagnosticFlags, diffTableAllowList, isSkipEnabled, isSyncStripped, logActiveDiagnosticFlags } from './diagnostic-flags.mjs';
 import { YamlReportExporter, withAdditionalFilters, processTdlOutputManipulation, diffFetchList } from './yaml-report-exporter.mjs';
+import { checkOrderSchema, findRemovedOrderHeaders, publishVoucherHeaders, type RemovedHeader } from './order-store.mjs';
 
 export interface incrementalMasterSyncTarget {
     table: tableConfigYAML;
@@ -208,6 +209,14 @@ class _tally {
                         this.lstTableMasterYaml = objYAML['master'];
                         this.lstTableTransactionYaml = objYAML['transaction'];
                         this.lstTableYaml = [...this.lstTableMasterYaml, ...this.lstTableTransactionYaml];
+                        if (this.lstTableYaml.some(table => table.order_details)
+                            && (database.config.technology !== 'postgres' || this.config.sync !== 'incremental')) {
+                            throw new Error('Voucher order details currently require PostgreSQL incremental sync');
+                        }
+                        if (this.lstTableYaml.some(table => table.order_details)
+                            && (activeDiagnosticFlags().length || diffTableAllowList())) {
+                            throw new Error('Disable diagnostic skips before running the order-detail profile; partial runs cannot publish reconciliation data');
+                        }
                         if (this.config.sync == 'incremental') {
                             this.validateIncrementalDefinition(this.lstTableYaml);
                         }
@@ -285,6 +294,11 @@ class _tally {
                             }
 
                             await this.validateIncrementalDatabaseSchema(lstTables);
+                            if (lstTables.some(table => table.order_details)) {
+                                const client = await database.connectionPoolPostgres.connect();
+                                try { await checkOrderSchema(client, this.config.company); }
+                                finally { client.release(); }
+                            }
                         }
 
                         //acquire last AlterID of master & transaction from last sync version of Database
@@ -313,6 +327,11 @@ class _tally {
                         await this.recordPhase('updateLastAlterId', () => this.updateLastAlterId()); //Update last alter ID
                         let lastAlterIdMasterTally = this.lastAlterIdMaster;
                         let lastAlterIdTransactionTally = this.lastAlterIdTransaction;
+                        if (this.lstTableYaml.some(table => table.order_details)
+                            && (!Number.isSafeInteger(lastAlterIdMasterTally) || !Number.isSafeInteger(lastAlterIdTransactionTally)
+                                || lastAlterIdMasterTally < lastAlterIdMasterDatabase || lastAlterIdTransactionTally < lastAlterIdTransactionDatabase)) {
+                            throw new Error('Tally AlterIDs are invalid or moved backwards; verify company/restore history before importing orders');
+                        }
 
                         //calculate flags to determine what changed
                         let flgIsMasterChanged = lastAlterIdMasterTally != lastAlterIdMasterDatabase;
@@ -333,6 +352,7 @@ class _tally {
                             lstPrimaryTables.push(...this.lstTableTransactionYaml.filter(p => p.nature == 'Primary'));
                         }
                         const diffTables = this.selectDiffTables(lstPrimaryTables);
+                        let removedOrderHeaders: RemovedHeader[] = [];
                         for (let i = 0; i < diffTables.length; i++) {
                             let activeTable = diffTables[i];
                             logger.logMessage('  detecting deletions in %s', activeTable.name);
@@ -340,6 +360,7 @@ class _tally {
                             await database.executeNonQuery('truncate table _diff;');
                             await database.executeNonQuery('truncate table _delete;');
                             let tempTable: tableConfigYAML = {
+                                voucher_identities: activeTable.order_details,
                                 name: '',
                                 collection: activeTable.collection,
                                 fields: [
@@ -363,6 +384,20 @@ class _tally {
                             let countDiffRows = await this.recordPhase('diff_load', () => database.bulkLoad(path.join(process.cwd(), `./csv/_diff.data`), '_diff', tempTable.fields.map(p => p.type)));
                             fs.unlinkSync(path.join(process.cwd(), `./csv/_diff.data`)); //delete temporary file
                             await this.validateDiffBeforeDeleteDetection(activeTable, countDiffRows);
+
+                            if (activeTable.order_details) {
+                                const client = await database.connectionPoolPostgres.connect();
+                                try {
+                                    // Include modified identities that may now fall outside the narrower
+                                    // export filter. Otherwise an old eligible header survives forever.
+                                    // Do not act on revisions beyond this run's pinned checkpoint.
+                                    removedOrderHeaders = await findRemovedOrderHeaders(client, lastAlterIdTransactionTally);
+                                } finally { client.release(); }
+                                // Preserve old headers until the structured replacement has validated.
+                                // This profile has no cascades; reject rather than silently bypass one.
+                                if (activeTable.cascade_delete?.length) throw new Error('Order-detail profile cannot use generic cascade deletion');
+                                continue;
+                            }
 
                             //insert into delete list rows there were deleted in current data compared to previous one
                             await this.recordPhase('delete_detection', () => database.executeNonQuery(`insert into _delete select guid from ${activeTable.name} where guid not in (select guid from _diff);`));
@@ -411,11 +446,23 @@ class _tally {
                                 let activeTable = this.lstTableTransactionYaml[i];
 
                                 activeTable = withAdditionalFilters(activeTable, [`$AlterID > ${lastAlterIdTransactionDatabase}`]);
+                                if (activeTable.order_details) {
+                                    activeTable = withAdditionalFilters(activeTable, [`$AlterID <= ${lastAlterIdTransactionTally}`]);
+                                }
 
                                 let targetTable = activeTable.name;
                                 let targetCsvFile = path.join(process.cwd(), `./csv/${targetTable}.data`);
                                 logger.logMessage('  syncing table %s', targetTable);
                                 await this.processReport(targetTable, activeTable, configTallyXML);
+                                if (activeTable.order_details) {
+                                    const client = await database.connectionPoolPostgres.connect();
+                                    try {
+                                        await publishVoucherHeaders(client, activeTable, fs.readFileSync(targetCsvFile, 'utf8'), removedOrderHeaders,
+                                            { after: lastAlterIdTransactionDatabase, through: lastAlterIdTransactionTally });
+                                    } finally { client.release(); }
+                                    fs.unlinkSync(targetCsvFile);
+                                    continue;
+                                }
                                 await this.recordPhase('delete_existing_guid_rows', () => database.deleteRowsMatchingCsvGuid(targetTable, targetCsvFile), targetTable, activeTable.collection);
                                 await this.recordPhase('bulk_load', () => database.bulkLoad(targetCsvFile, targetTable, activeTable.fields.map(p => p.type)), targetTable, activeTable.collection);
                                 fs.unlinkSync(targetCsvFile); //delete raw file
@@ -504,7 +551,9 @@ class _tally {
                             logger.logMessage('  skipping AlterID checkpoint update: diagnostic flags were set for this run');
                         }
                         else {
-                            await this.recordPhase('saveCompanyInfo', () => this.saveCompanyInfo(true));
+                            await this.recordPhase('saveCompanyInfo', () => this.saveCompanyInfo(true, {
+                                master: lastAlterIdMasterTally, transaction: lastAlterIdTransactionTally
+                            }));
                         }
                     }
                     else
@@ -938,7 +987,7 @@ class _tally {
         });
     }
 
-    private saveCompanyInfo(writeAlterIdMarkers: boolean = true): Promise<void> {
+    private saveCompanyInfo(writeAlterIdMarkers: boolean = true, checkpoint?: { master: number; transaction: number }): Promise<void> {
         return new Promise<void>(async (resolve, reject) => {
             try {
                 const convertDateYYYYMMDD = (dateStr: string): string => {
@@ -962,8 +1011,8 @@ class _tally {
                         this.config.fromdate = convertDateYYYYMMDD(lstCompanyInfoParts[2]);
                         this.config.todate = convertDateYYYYMMDD(lstCompanyInfoParts[3]);
                     }
-                    let altIdMaster = parseInt(lstCompanyInfoParts[4]);
-                    let altIdTransaction = parseInt(lstCompanyInfoParts[5]);
+                    let altIdMaster = checkpoint?.master ?? parseInt(lstCompanyInfoParts[4]);
+                    let altIdTransaction = checkpoint?.transaction ?? parseInt(lstCompanyInfoParts[5]);
                     if (!writeAlterIdMarkers) {
                         return resolve();
                     }

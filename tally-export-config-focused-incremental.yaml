@@ -383,10 +383,11 @@ master:
         field: item
 transaction:
   - name: trn_voucher
+    order_details: true
     collection: Voucher
     nature: Primary
     fetch:
-      - AlterId,Narration,PartyLedgerName,PlaceOfSupply,Reference,ReferenceDate
+      - AlterId,Narration,PartyLedgerName,PlaceOfSupply,Reference,ReferenceDate,InvoiceOrderList.*
     filters:
       - NOT $IsCancelled
       - NOT $IsOptional
@@ -447,3 +448,9 @@ transaction:
       - name: is_order_voucher
         field: if $$IsOrderVch:$VoucherTypeName then 1 else 0
         type: logical
+      - name: order_details
+        field: '"KE_COMPUTED"'
+        type: text
+      - name: order_number
+        field: '"KE_COMPUTED"'
+        type: text

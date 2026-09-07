@@ -3,6 +3,7 @@ import { database } from './database.mjs';
 import { logger } from './logger.mjs';
 import { tallyConfig } from './definition.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
+import { assertOrderImportLock } from './order-store.mjs';
 
 export interface godownStockRow {
     item: string;
@@ -690,6 +691,7 @@ export async function ensureGodownStockSnapshotSchema(client: postgresQueryClien
         await client.query('alter table public.stock_godown_summary add column if not exists as_on_date date null');
         await client.query('alter table public.stock_godown_summary add column if not exists source_company text null');
         await client.query('alter table public.stock_godown_summary add column if not exists source_snapshot_id text null');
+        assertOrderImportLock();
         await client.query('commit');
     } catch (err) {
         await client.query('rollback');
@@ -776,6 +778,7 @@ export async function publishGodownStockSnapshot(
                 publication.metrics.rejectedRows
             ]
         );
+        assertOrderImportLock();
         await client.query('commit');
     } catch (err) {
         await client.query('rollback');

@@ -1,6 +1,7 @@
 import { database } from './database.mjs';
 import { logger } from './logger.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
+import { assertOrderImportLock } from './order-store.mjs';
 const markerName = 'Last Voucher Inventory AlterID';
 function escapeXml(value) {
     return String(value)
@@ -225,6 +226,7 @@ export async function replaceVoucherInventoryRows(rows, updateMarker = true, mar
             await client.query(`insert into public.config(name, value) values($1, $2)
                 on conflict (name) do update set value = excluded.value`, [markerName, String(nextMarkerAlterId)]);
         }
+        assertOrderImportLock();
         await client.query('commit');
         return rows.length;
     }

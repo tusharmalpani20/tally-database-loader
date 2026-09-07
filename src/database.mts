@@ -1,10 +1,13 @@
 import fs from 'fs';
 import { pipeline } from 'stream/promises';
+import { createInterface } from 'node:readline';
 import mysql from 'mysql2/promise';
 import mssql from 'tedious';
 import postgres from 'pg';
 import { BigQuery } from '@google-cloud/bigquery';
 import { from as pgLoadInto } from 'pg-copy-streams';
+import { copyStatement, csvColumns } from './postgres-columns.mjs';
+import { ORDER_SCHEMA_SQL, assertOrderImportLock } from './order-store.mjs';
 import { logger } from './logger.mjs';
 import { connectionConfig, queryResult, databaseFieldInfo, tableConfigJSON } from './definition.mjs';
 
@@ -632,6 +635,9 @@ class _database {
                         return p;
                     });
                     await this.executePostgres(lstPostgresCreateTableSQL);
+                    if (!lstExistingTables.includes('trn_voucher')) {
+                        await this.executePostgres(ORDER_SCHEMA_SQL);
+                    }
                 }
                 resolve();
             }
@@ -745,6 +751,7 @@ class _database {
                 let data: any[] = [];
                 if (Array.isArray(sqlQuery)) { //multiple query
                     for (const qry of sqlQuery) {
+                        assertOrderImportLock();
                         await connection.query(qry);
                     }
                 }
@@ -753,6 +760,7 @@ class _database {
                         rowMode: 'array',
                         text: sqlQuery
                     };
+                    assertOrderImportLock();
                     let result = await connection.query(qryConfig);
                     rowCount = result.rowCount || 0;
                     data = result.rows;
@@ -824,8 +832,15 @@ class _database {
         return new Promise<number>(async (resolve, reject) => {
             let connection = await this.connectionPoolPostgres.connect();
             try {
+                const headerStream = fs.createReadStream(`./csv/${targetTable}.data`, 'utf8');
+                let header = '';
+                const reader = createInterface({ input: headerStream, crlfDelay: Infinity });
+                try {
+                    for await (const line of reader) { header = line; break; }
+                } finally { reader.close(); headerStream.destroy(); }
+                let ptrCopyQueryStream = pgLoadInto(copyStatement(targetTable, csvColumns(header)));
+                assertOrderImportLock();
                 const sourceStream = fs.createReadStream(`./csv/${targetTable}.data`, 'utf-8');
-                let ptrCopyQueryStream = pgLoadInto(`copy ${targetTable} from stdin csv header;`);
                 const targetStream = connection.query(ptrCopyQueryStream);
                 await pipeline(sourceStream, targetStream);
                 resolve(ptrCopyQueryStream.rowCount || 0);

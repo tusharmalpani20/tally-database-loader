@@ -1,5 +1,6 @@
 import { appConfig, cloneConfig } from './config.mjs';
 import { database } from './database.mjs';
+import { assertOrderImportLock, withOrderImportLock } from './order-store.mjs';
 import { logger } from './logger.mjs';
 import { createSyncStatus, syncStatus, updateSyncStatus, writeSyncStatus } from './status.mjs';
 import { tally } from './tally.mjs';
@@ -127,6 +128,10 @@ function emptyGodownStockRefreshResult(config: tallyConfig): godownStockRefreshR
 }
 
 async function invokeImport(): Promise<void> {
+    return withOrderImportLock(database.config, invokeImportUnlocked);
+}
+
+async function invokeImportUnlocked(): Promise<void> {
     const runStartedAt = new Date();
     try {
         isSyncRunning = true;
@@ -160,6 +165,7 @@ async function invokeImport(): Promise<void> {
         }
 
         const customRows = stock.rowCount + voucherRows;
+        assertOrderImportLock();
         await recordSyncRunPing({
             operation: 'sync',
             status: 'success',
@@ -278,9 +284,11 @@ export async function runSync(options: syncRunOptions): Promise<void> {
 
                 const isDataChanged = !(lastMasterAlterId == tally.lastAlterIdMaster && lastTransactionAlterId == tally.lastAlterIdTransaction);
                 if (isDataChanged) {
-                    lastMasterAlterId = tally.lastAlterIdMaster;
-                    lastTransactionAlterId = tally.lastAlterIdTransaction;
+                    const master = tally.lastAlterIdMaster;
+                    const transaction = tally.lastAlterIdTransaction;
                     await invokeImport();
+                    lastMasterAlterId = master;
+                    lastTransactionAlterId = transaction;
                 }
                 else {
                     const checkedAt = new Date();

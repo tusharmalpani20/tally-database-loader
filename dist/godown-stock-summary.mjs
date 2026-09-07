@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { database } from './database.mjs';
 import { logger } from './logger.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
+import { assertOrderImportLock } from './order-store.mjs';
 export function populateGodownGuids(rows, godowns) {
     const guidByName = new Map();
     const ambiguousNames = new Set();
@@ -549,6 +550,7 @@ export async function ensureGodownStockSnapshotSchema(client) {
         await client.query('alter table public.stock_godown_summary add column if not exists as_on_date date null');
         await client.query('alter table public.stock_godown_summary add column if not exists source_company text null');
         await client.query('alter table public.stock_godown_summary add column if not exists source_snapshot_id text null');
+        assertOrderImportLock();
         await client.query('commit');
     }
     catch (err) {
@@ -605,6 +607,7 @@ export async function publishGodownStockSnapshot(client, rows, publication) {
             publication.metrics.zeroRows,
             publication.metrics.rejectedRows
         ]);
+        assertOrderImportLock();
         await client.query('commit');
     }
     catch (err) {

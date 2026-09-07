@@ -3,6 +3,7 @@ import path from 'path';
 import process from 'process';
 import { utility } from './utility.mjs';
 import { PhaseTimer } from './metrics.mjs';
+import { addOrderDetailReport, parseOrderVouchers, parseVoucherIdentities } from './order-details.mjs';
 export class YamlReportExporter {
     transport;
     metrics;
@@ -32,7 +33,11 @@ export class YamlReportExporter {
                 throw err;
             }
             const transformTimer = new PhaseTimer(this.metrics, this.metricBase('tdl_transform', targetTable, tableConfig.collection));
-            const transformed = processTdlOutputManipulation(output);
+            const transformed = tableConfig.voucher_identities
+                ? parseVoucherIdentities(output, String(substitutions?.get('targetCompany') || '')).map(row => row.join('\t')).join('\r\n')
+                : tableConfig.order_details
+                    ? parseOrderVouchers(output, tableConfig, String(substitutions?.get('targetCompany') || '')).map(row => row.values.map(value => value.replace(/[\t\r\n]/g, ' ')).join('\t')).join('\r\n')
+                    : processTdlOutputManipulation(output);
             const rows = countRows(transformed);
             transformTimer.end(true, undefined, { rows });
             const writeTimer = new PhaseTimer(this.metrics, this.metricBase('file_write', targetTable, tableConfig.collection));
@@ -160,11 +165,11 @@ export function generateXMLfromYAML(tblConfig) {
     retval += `</COLLECTION>`;
     if (tblConfig.filters && tblConfig.filters.length)
         for (let j = 0; j < tblConfig.filters.length; j++)
-            retval += `<SYSTEM TYPE="Formulae" NAME="${utility.Number.format(j + 1, 'Fltr00')}">${tblConfig.filters[j]}</SYSTEM>`;
+            retval += `<SYSTEM TYPE="Formulae" NAME="${utility.Number.format(j + 1, 'Fltr00')}">${utility.String.escapeHTML(tblConfig.filters[j])}</SYSTEM>`;
     retval += `</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
-    return retval;
+    return tblConfig.order_details || tblConfig.voucher_identities ? addOrderDetailReport(retval, tblConfig) : retval;
 }
-function substituteTDLParameters(msg, substitutions) {
+export function substituteTDLParameters(msg, substitutions) {
     let retval = msg;
     substitutions.forEach((v, k) => {
         const regPtrn = new RegExp(`\\{${k}\\}`);
@@ -185,7 +190,7 @@ function substituteTDLParameters(msg, substitutions) {
  * unsubstituted placeholder, which restores the previous "let Tally decide" behaviour for that
  * one variable instead of asking Tally to parse "{fromDate}".
  */
-function dropUnresolvedStaticVariables(xml) {
+export function dropUnresolvedStaticVariables(xml) {
     return xml
         .replace(/<SV[A-Z]+>\{\w+\}<\/SV[A-Z]+>/g, '')
         .replace(/<SVCURRENTCOMPANY>##SVCurrentCompany<\/SVCURRENTCOMPANY>/g, '');

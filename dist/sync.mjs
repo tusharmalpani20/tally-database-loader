@@ -1,5 +1,6 @@
 import { cloneConfig } from './config.mjs';
 import { database } from './database.mjs';
+import { assertOrderImportLock, withOrderImportLock } from './order-store.mjs';
 import { logger } from './logger.mjs';
 import { createSyncStatus, updateSyncStatus, writeSyncStatus } from './status.mjs';
 import { tally } from './tally.mjs';
@@ -94,6 +95,9 @@ function emptyGodownStockRefreshResult(config) {
     };
 }
 async function invokeImport() {
+    return withOrderImportLock(database.config, invokeImportUnlocked);
+}
+async function invokeImportUnlocked() {
     const runStartedAt = new Date();
     try {
         isSyncRunning = true;
@@ -121,6 +125,7 @@ async function invokeImport() {
             logger.logMessage('Skipping godown stock summary refresh: TALLY_SKIP_GODOWN_STOCK is set');
         }
         const customRows = stock.rowCount + voucherRows;
+        assertOrderImportLock();
         await recordSyncRunPing({
             operation: 'sync',
             status: 'success',
@@ -231,9 +236,11 @@ export async function runSync(options) {
                 await tally.updateLastAlterId();
                 const isDataChanged = !(lastMasterAlterId == tally.lastAlterIdMaster && lastTransactionAlterId == tally.lastAlterIdTransaction);
                 if (isDataChanged) {
-                    lastMasterAlterId = tally.lastAlterIdMaster;
-                    lastTransactionAlterId = tally.lastAlterIdTransaction;
+                    const master = tally.lastAlterIdMaster;
+                    const transaction = tally.lastAlterIdTransaction;
                     await invokeImport();
+                    lastMasterAlterId = master;
+                    lastTransactionAlterId = transaction;
                 }
                 else {
                     const checkedAt = new Date();
