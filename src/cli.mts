@@ -579,6 +579,18 @@ program
     .version('1.0.0')
     .action(runMainMenu);
 
+program.command('voucher-orders')
+    .description('Preview voucher order details; --apply backfills only order columns at the same source revision')
+    .requiredOption('--guids <guids>', 'comma-separated list of 1–50 voucher GUIDs')
+    .option('--apply', 'write revision-matched order details to PostgreSQL', false)
+    .action(async (options: { guids: string; apply: boolean }) => {
+        const config = loadConfig();
+        const errors = validateConfig(config);
+        if (errors.length) throw new Error(errors.join('; '));
+        const { backfillOrders } = await import('./order-backfill.mjs');
+        console.log(JSON.stringify(await backfillOrders(config, options.guids.split(',').map(value => value.trim()), options.apply), null, 2));
+    });
+
 program.command('setup')
     .description('Create or update config.json with a guided wizard')
     .action(runSetupCommand);
