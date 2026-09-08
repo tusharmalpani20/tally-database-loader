@@ -11,6 +11,16 @@ const table = yaml.load(fs.readFileSync('tally-export-config-focused-incremental
 const scope = { company: 'Fixture', companyGuid: '11111111-2222-3333-4444-555555555555', guid: 'fixture-guid', masterId: '42', from: '2024-04-01', to: '2027-03-31' };
 const fixture = (orders = '<ORDER><NUMBER>SO-1</NUMBER><DATE>20260902</DATE></ORDER>', count = 1) => `<ENVELOPE><PROTOCOL>KE_DIRECT_ORDERS_V1</PROTOCOL><COMPANY>Fixture</COMPANY><COMPANYGUID>${scope.companyGuid}</COMPANYGUID><GUID>fixture-guid</GUID><MASTERID>42</MASTERID><ALTERID>123</ALTERID><VOUCHERTYPE>Delivery Challan</VOUCHERTYPE><DATE>20260902</DATE><CANCELLED>0</CANCELLED><OPTIONAL>0</OPTIONAL><ELIGIBLE>1</ELIGIBLE><ORDERCOUNT>${count}</ORDERCOUNT>${orders}</ENVELOPE>`;
 
+test('direct report definitions are unique under Tally case and space insensitive naming', () => {
+    const xml = directOrderRequest(scope, table);
+    const definitions = [...xml.matchAll(/<(REPORT|FORM|PART|LINE|FIELD|COLLECTION) NAME="([^"]+)"/g)]
+        .map(([, type, name]) => `${type}:${name.replace(/\s/g, '').toLowerCase()}`);
+    assert.equal(new Set(definitions).size, definitions.length, 'TDL definition names collide');
+    assert.match(xml, /<FIELD NAME="KEDODATE"><SET>[^<]*\$Date/);
+    assert.match(xml, /<FIELDS>KEDONumber,KEDOOrderDate<\/FIELDS>/);
+    assert.match(xml, /<FIELD NAME="KEDOOrderDate"><SET>[^<]*\$BasicOrderDate/);
+});
+
 test('direct contract retains proven object binding, embedded company reads and profile eligibility', () => {
     const xml = directOrderRequest(scope, table);
     assert.equal(XMLValidator.validate(xml), true);

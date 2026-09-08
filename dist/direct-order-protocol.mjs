@@ -42,9 +42,9 @@ export function directOrderRequest(scope, table) {
 <LINE NAME="KEDOLine"><FIELDS>${fields.map(([tag]) => `KEDO${tag}`).join(',')}</FIELDS><EXPLODE>KEDOOrders : Yes</EXPLODE></LINE>
 ${fields.map(([tag, expression]) => `<FIELD NAME="KEDO${tag}"><SET>${escape(expression)}</SET><XMLTAG>${tag}</XMLTAG></FIELD>`).join('\n')}
 <PART NAME="KEDOOrders"><LINES>KEDOOrder</LINES><REPEAT>KEDOOrder : InvoiceOrderList</REPEAT></PART>
-<LINE NAME="KEDOOrder"><XMLTAG>ORDER</XMLTAG><FIELDS>KEDONumber,KEDODate</FIELDS></LINE>
+<LINE NAME="KEDOOrder"><XMLTAG>ORDER</XMLTAG><FIELDS>KEDONumber,KEDOOrderDate</FIELDS></LINE>
 <FIELD NAME="KEDONumber"><SET>$BasicPurchaseOrderNo</SET><XMLTAG>NUMBER</XMLTAG></FIELD>
-<FIELD NAME="KEDODate"><SET>If $$IsEmpty:$BasicOrderDate Then "" Else (($$YearOfDate:$BasicOrderDate)*10000)+(($$MonthOfDate:$BasicOrderDate)*100)+$$DayOfDate:$BasicOrderDate</SET><XMLTAG>DATE</XMLTAG></FIELD>
+<FIELD NAME="KEDOOrderDate"><SET>If $$IsEmpty:$BasicOrderDate Then "" Else (($$YearOfDate:$BasicOrderDate)*10000)+(($$MonthOfDate:$BasicOrderDate)*100)+$$DayOfDate:$BasicOrderDate</SET><XMLTAG>DATE</XMLTAG></FIELD>
 </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
 }
 function structure(value, allowed) {
