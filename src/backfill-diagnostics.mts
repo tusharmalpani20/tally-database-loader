@@ -43,7 +43,7 @@ export class BackfillDiagnostics {
 }
 
 export async function fetchBackfillVouchers(transport: TallyTransport, request: string,
-    table: tableConfigYAML, company: string, diagnostics: BackfillDiagnostics) {
+    table: tableConfigYAML, company: string, diagnostics: BackfillDiagnostics, direct = false) {
     diagnostics.xml('request', request);
     diagnostics.log(`Sending Tally export (${Buffer.byteLength(request, 'utf8')} UTF-8 bytes). Waiting for the request lock or Tally response...`);
     const heartbeat = setInterval(() => diagnostics.log('Still waiting for the request lock or Tally response; no order-data updates have started.'), 15000);
@@ -67,7 +67,7 @@ export async function fetchBackfillVouchers(transport: TallyTransport, request: 
     diagnostics.xml('response', response);
     diagnostics.log('Validating response structure, company, voucher identities and order lists...');
     try {
-        const rows = parseOrderVouchers(response, table, company);
+        const rows = parseOrderVouchers(response, table, company, direct);
         diagnostics.log(`Response validated: ${rows.length} voucher(s).`);
         return rows;
     } catch (error) {

@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import yaml from 'js-yaml';
 import { XMLValidator } from 'fast-xml-parser';
-import { addOrderDetailReport, parseOrderVouchers, parseVoucherIdentities, resolveOrderNumber, validateOrderDetails } from '../dist/order-details.mjs';
+import { addOrderDetailReport, directOrderReport, parseOrderVouchers, parseVoucherIdentities, resolveOrderNumber, validateOrderDetails } from '../dist/order-details.mjs';
 import { generateXMLfromYAML, substituteTDLParameters, withAdditionalFilters } from '../dist/yaml-report-exporter.mjs';
-import { backfillDefinition } from '../dist/order-backfill.mjs';
+import { backfillDefinition, backfillPeriod } from '../dist/order-backfill.mjs';
 import { csvColumns, copyStatement } from '../dist/postgres-columns.mjs';
 
 const table = yaml.load(fs.readFileSync('tally-export-config-focused-incremental.yaml', 'utf8')).transaction[0];
@@ -43,9 +43,9 @@ test('final backfill request preserves every TDL function and literal company su
     }
     assert.doesNotMatch(request, /(?<!\$)\$(?:NumItems|IsEmpty|YearOfDate|MonthOfDate|DayOfDate|IsEqual):/);
     assert.ok(request.includes('<SVCURRENTCOMPANY>Fixture $$ &amp; $&amp; Co</SVCURRENTCOMPANY>'));
-    assert.match(request, /<PARTS>KEMetadataPart,MyPart<\/PARTS>/);
+    assert.match(request, /<TOPPARTS>KEMetadataPart<\/TOPPARTS>/);
     assert.match(request, /<REPEAT>KEExportCount : KEMetadataCompany<\/REPEAT>/);
-    assert.match(request, /<LINE NAME="KEExportCount"><XMLTAG>KEMETADATA<\/XMLTAG>/);
+    assert.match(request, /<LINE NAME="KEExportCount"><FIELDS>KEExportCountField,KECompany<\/FIELDS><EXPLODE>MyPart : Yes<\/EXPLODE>/);
     assert.match(request, /<FIELD NAME="KECompany"><SET>\$Name<\/SET>/);
     assert.doesNotMatch(request, /<LINES>KEExportCount,MyLine<\/LINES>/);
 });
@@ -96,6 +96,51 @@ test('known challan extracts the voucher-level order number and date', () => {
     assert.deepEqual(row.order_details, [{ order_number: 'KE-SO-00018-26-27', order_date: '2026-09-02' }]);
 });
 
+test('direct order report avoids voucher collection scans and preserves server-side safety checks', () => {
+    const base = generateXMLfromYAML(backfillDefinition(table, ['fixture-guid']));
+    const xml = directOrderReport(base, '1005439');
+    assert.equal(XMLValidator.validate(xml), true);
+    assert.match(xml, /<OBJECTEX>\(Voucher,"ID:1005439"\)<\/OBJECTEX>/);
+    assert.doesNotMatch(xml, /<COLLECTION NAME="MyCollection">|MyLine : MyCollection|\$\$NumItems:MyCollection/);
+    assert.ok(xml.includes('If $$IsEmpty:$Guid:Voucher:"ID:1005439" Then 0 Else 1'));
+    assert.ok(xml.includes('@@Fltr01 AND @@Fltr02 AND @@Fltr03 AND @@Fltr04'));
+    assert.match(xml, /\$Date &gt;= ##SVFromDate AND \$Date &lt;= ##SVToDate/);
+    assert.match(xml, /<SET>\$Name<\/SET><XMLTAG>KECOMPANY/);
+    assert.match(xml, /\$\$NumItems:InvoiceOrderList/);
+    for (const id of ['', '0', '42"', '-1']) assert.throws(() => directOrderReport(base, id), /MasterID/);
+    for (const anchor of ['<PART NAME="MyPart">', '<REPEAT>MyLine : MyCollection</REPEAT>', '$$NumItems:MyCollection']) {
+        assert.throws(() => directOrderReport(base.replace(anchor, ''), '1005439'));
+        assert.throws(() => directOrderReport(base.replace(anchor, () => anchor + anchor), '1005439'));
+    }
+    assert.throws(() => directOrderReport(base.replace('<FILTER>Fltr01,Fltr02,Fltr03,Fltr04</FILTER>', '<FILTER>Fltr99</FILTER>'), '1005439'), /eligibility/);
+    assert.throws(() => directOrderReport(base.replace('NAME="Fltr01"', 'NAME="Missing"'), '1005439'), /eligibility/);
+    const extra = base.replace('</TDLMESSAGE>', '<SYSTEM TYPE="Formulae" NAME="Fltr99">No</SYSTEM></TDLMESSAGE>');
+    assert.doesNotMatch(directOrderReport(extra, '1005439'), /@@Fltr99/);
+});
+
+test('backfill period rejects invalid, reversed, missing and ambiguous database metadata', () => {
+    const rows = [{ name: 'Company Name', value: 'Fixture' }, { name: 'Period From', value: '2024-04-01' }, { name: 'Period To', value: '2027-03-31' }];
+    assert.deepEqual(backfillPeriod(rows, 'Fixture'), { from: '2024-04-01', to: '2027-03-31' });
+    for (const from of ['2026-02-30', '0000-01-01', '2028-01-01', '', 'invalid']) {
+        assert.throws(() => backfillPeriod(rows.map(row => row.name === 'Period From' ? { ...row, value: from } : row), 'Fixture'), /period/);
+    }
+    assert.throws(() => backfillPeriod(rows, 'Wrong'), /company/);
+    assert.throws(() => backfillPeriod(rows.slice(1), 'Fixture'), /metadata/);
+    assert.throws(() => backfillPeriod([...rows, rows[1]], 'Fixture'), /metadata/);
+});
+
+test('direct parsing requires explicit eligibility as well as company, count and order validation', () => {
+    const xml = response().replace('<ENVELOPE>', '<ENVELOPE><KECOMPANY>Fixture</KECOMPANY>')
+        .replace('<KEVOUCHER>', '<KEVOUCHER><KEDIRECTELIGIBLE>1</KEDIRECTELIGIBLE>');
+    assert.equal(parseOrderVouchers(xml, table, 'Fixture', true)[0].order_number, 'KE-SO-00018-26-27');
+    for (const invalid of [xml.replace('ELIGIBLE>1', 'ELIGIBLE>0'),
+        xml.replace('<KEDIRECTELIGIBLE>1</KEDIRECTELIGIBLE>', ''),
+        xml.replace('COUNT>1', 'COUNT>0'), xml.replace('Fixture', 'Wrong'),
+        xml.replace('<KEEXPORTCOUNT>1</KEEXPORTCOUNT>', '')]) {
+        assert.throws(() => parseOrderVouchers(invalid, table, 'Fixture', true));
+    }
+});
+
 test('production parsing verifies the returned company', () => {
     assert.throws(() => parseOrderVouchers(response(), table, 'Fixture Co'));
     const xml = response().replace('<ENVELOPE>', '<ENVELOPE><KECOMPANY>Fixture Co</KECOMPANY>');
@@ -109,8 +154,8 @@ test('voucher deletion scan is counted and company-checked without exporting ord
     assert.equal(XMLValidator.validate(request), true);
     assert.match(request, /KEEXPORTCOUNT/);
     assert.ok(request.includes('$$NumItems:MyCollection'));
-    assert.match(request, /<PARTS>KEMetadataPart,MyPart<\/PARTS>/);
-    assert.doesNotMatch(request, /<EXPLODE>/);
+    assert.match(request, /<TOPPARTS>KEMetadataPart<\/TOPPARTS>/);
+    assert.doesNotMatch(request, /<EXPLODE>KEOrders/);
     const row = '<KEVOUCHER><F01>fixture</F01><F02>10</F02></KEVOUCHER>';
     const xml = `<ENVELOPE><KECOMPANY>Fixture</KECOMPANY><KEEXPORTCOUNT>1</KEEXPORTCOUNT>${row}</ENVELOPE>`;
     assert.deepEqual(parseVoucherIdentities(xml, 'Fixture'), [['fixture', '10']]);

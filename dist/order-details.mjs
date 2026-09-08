@@ -68,7 +68,7 @@ function countedVoucherRows(xml, expectedCompany) {
     if (!envelope || typeof envelope !== 'object') {
         throw new Error('Missing voucher export completeness count');
     }
-    // New reports export metadata as a separate, company-backed repeated line.
+    // Accept both the company-root flat layout and the earlier nested layout.
     // Accept the earlier flat layout too, but never accept absent/ambiguous metadata.
     const metadata = envelope.KEMETADATA ?? envelope;
     if (Array.isArray(metadata))
@@ -105,12 +105,14 @@ export function parseVoucherIdentities(xml, expectedCompany) {
         return [guid, alterid];
     });
 }
-export function parseOrderVouchers(xml, table, expectedCompany) {
+export function parseOrderVouchers(xml, table, expectedCompany, direct = false) {
     const rows = countedVoucherRows(xml, expectedCompany);
     const seen = new Set();
     return rows.map((row) => {
-        assertStructure(row, ['KEORDERCOUNT', 'KEORDER', 'FLDBLANK',
+        assertStructure(row, ['KEORDERCOUNT', 'KEORDER', 'FLDBLANK', ...(direct ? ['KEDIRECTELIGIBLE'] : []),
             ...table.fields.map((_, index) => `F${String(index + 1).padStart(2, '0')}`)], 'voucher row');
+        if (direct && scalar(row, 'KEDIRECTELIGIBLE') !== '1')
+            throw new Error('Direct voucher is outside the eligible filters or export period');
         const values = table.fields.map((_, index) => scalar(row, `F${String(index + 1).padStart(2, '0')}`));
         const guid = values[table.fields.findIndex(field => field.name === 'guid')];
         const revision = values[table.fields.findIndex(field => field.name === 'alterid')];
@@ -157,15 +159,44 @@ export function addOrderDetailReport(xml, table) {
 }
 function addCountedVoucherReport(xml) {
     xml = insertOnce(xml, '<REPORT NAME="TallyDatabaseLoaderReport">', '<REPORT NAME="TallyDatabaseLoaderReport"><EXPORTEMPTYFIELDS>Yes</EXPORTEMPTYFIELDS>');
-    xml = insertOnce(xml, '<PARTS>MyPart</PARTS>', '<PARTS>KEMetadataPart,MyPart</PARTS>');
+    // Metadata must be the root of the exported hierarchy, not a sibling part
+    // which Tally can omit from XML. Explode vouchers beneath the company line.
+    xml = insertOnce(xml, '<PARTS>MyPart</PARTS>', '<TOPPARTS>KEMetadataPart</TOPPARTS>');
     xml = insertOnce(xml, '<LINE NAME="MyLine"><FIELDS>', '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><FIELDS>');
     return insertOnce(xml, '</TDLMESSAGE>', `
-<PART NAME="KEMetadataPart"><LINES>KEExportCount</LINES><REPEAT>KEExportCount : KEMetadataCompany</REPEAT></PART>
-<LINE NAME="KEExportCount"><XMLTAG>KEMETADATA</XMLTAG><FIELDS>KEExportCountField,KECompany</FIELDS></LINE>
+<PART NAME="KEMetadataPart"><TOPLINES>KEExportCount</TOPLINES><REPEAT>KEExportCount : KEMetadataCompany</REPEAT></PART>
+<LINE NAME="KEExportCount"><FIELDS>KEExportCountField,KECompany</FIELDS><EXPLODE>MyPart : Yes</EXPLODE></LINE>
 <COLLECTION NAME="KEMetadataCompany"><TYPE>Company</TYPE><FETCH>Name</FETCH><FILTER>KEMetadataCurrentCompany</FILTER></COLLECTION>
 <SYSTEM TYPE="Formulae" NAME="KEMetadataCurrentCompany">$$IsEqual:$Name:##SVCurrentCompany</SYSTEM>
 <FIELD NAME="KECompany"><SET>$Name</SET><XMLTAG>KECOMPANY</XMLTAG></FIELD>
 <FIELD NAME="KEExportCountField"><SET>$$NumItems:MyCollection</SET><XMLTAG>KEEXPORTCOUNT</XMLTAG></FIELD>
 </TDLMESSAGE>`);
+}
+// Bind only the voucher part to a primary object. The company-root metadata
+// remains independently evaluated; no synthetic client-side count is injected.
+export function directOrderReport(xml, masterId) {
+    if (!/^[1-9]\d{0,9}$/.test(masterId))
+        throw new Error('Invalid Tally MasterID (not AlterID)');
+    const collections = xml.match(/<COLLECTION NAME="MyCollection">[\s\S]*?<\/COLLECTION>/g);
+    if (collections?.length !== 1)
+        throw new Error('Direct backfill requires exactly one voucher collection');
+    // Preserve the filters actually attached to the removed collection, not
+    // unrelated formula definitions which may be present elsewhere in the TDL.
+    const filterTags = [...collections[0].matchAll(/<FILTER>([^<]*)<\/FILTER>/g)];
+    if (filterTags.length !== 1)
+        throw new Error('Direct backfill requires voucher eligibility filters');
+    const filterNames = filterTags[0][1].split(',').map(name => name.trim());
+    if (!filterNames.length || new Set(filterNames).size !== filterNames.length
+        || filterNames.some(name => !/^Fltr\d+$/.test(name)
+            || xml.split(`<SYSTEM TYPE="Formulae" NAME="${name}">`).length !== 2)) {
+        throw new Error('Direct backfill has missing or ambiguous eligibility formulas');
+    }
+    const filters = filterNames.map(name => `@@${name}`);
+    xml = insertOnce(xml, '<PART NAME="MyPart">', `<PART NAME="MyPart"><OBJECTEX>(Voucher,"ID:${masterId}")</OBJECTEX>`);
+    xml = insertOnce(xml, '<REPEAT>MyLine : MyCollection</REPEAT>', '');
+    xml = insertOnce(xml, collections[0], '');
+    xml = insertOnce(xml, '<FIELDS>KEOrderCount,', '<FIELDS>KEDirectEligible,KEOrderCount,');
+    xml = insertOnce(xml, '</TDLMESSAGE>', `<FIELD NAME="KEDirectEligible"><SET>If (${filters.join(' AND ')} AND $Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate) Then 1 Else 0</SET><XMLTAG>KEDIRECTELIGIBLE</XMLTAG></FIELD></TDLMESSAGE>`);
+    return insertOnce(xml, '$$NumItems:MyCollection', `If $$IsEmpty:$Guid:Voucher:"ID:${masterId}" Then 0 Else 1`);
 }
 //# sourceMappingURL=order-details.mjs.map

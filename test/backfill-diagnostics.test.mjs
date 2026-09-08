@@ -49,3 +49,18 @@ test('valid empty response logs validation; transport errors remain errors', asy
     await assert.rejects(fetchBackfillVouchers({ post: async () => { throw new Error('timeout'); } },
         '<REQUEST/>', table, 'Company', diagnostics), /timeout/);
 });
+
+test('direct backfill fetch enforces eligibility before returning rows to the database caller', async () => {
+    const diagnostics = new BackfillDiagnostics({ write: () => {} });
+    const values = { guid: 'fixture-guid', alterid: '5' };
+    const fields = table.fields.map((field, i) => {
+        const tag = `F${String(i + 1).padStart(2, '0')}`;
+        return `<${tag}>${values[field.name] || ''}</${tag}>`;
+    }).join('');
+    const xml = `<ENVELOPE><KECOMPANY>Company</KECOMPANY><KEEXPORTCOUNT>1</KEEXPORTCOUNT><KEVOUCHER><KEDIRECTELIGIBLE>1</KEDIRECTELIGIBLE><KEORDERCOUNT>0</KEORDERCOUNT>${fields}</KEVOUCHER></ENVELOPE>`;
+    const fetch = body => fetchBackfillVouchers({ post: async () => body }, '<REQUEST/>', table, 'Company', diagnostics, true);
+    assert.equal((await fetch(xml)).length, 1);
+    await assert.rejects(fetch(xml.replace('ELIGIBLE>1', 'ELIGIBLE>0')), /eligible/);
+    await assert.rejects(fetch(xml.replace('<KEDIRECTELIGIBLE>1</KEDIRECTELIGIBLE>', '')), /KEDIRECTELIGIBLE/);
+    await assert.rejects(fetch(xml.replace('<KEEXPORTCOUNT>1</KEEXPORTCOUNT>', '')), /completeness count/);
+});

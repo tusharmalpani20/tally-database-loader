@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import yaml from 'js-yaml';
 import { Client } from 'pg';
+import { directOrderReport } from './order-details.mjs';
 import type { appConfig } from './config.mjs';
 import type { tableConfigYAML } from './definition.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
@@ -18,7 +19,23 @@ export function backfillDefinition(table: tableConfigYAML, guids: string[]): tab
     return withAdditionalFilters(table, [`(${guids.map(guid => `$Guid = "${guid}"`).join(' OR ')})`]);
 }
 
-export async function backfillOrders(config: appConfig, guids: string[], apply = false, options: BackfillLogOptions = {}) {
+export function backfillPeriod(rows: { name: string; value: string }[], company: string): { from: string; to: string } {
+    const value = (name: string) => {
+        const matches = rows.filter(row => row.name === name);
+        if (matches.length !== 1 || typeof matches[0].value !== 'string') throw new Error(`Missing or ambiguous backfill metadata: ${name}`);
+        return matches[0].value;
+    };
+    if (!company || value('Company Name') !== company) throw new Error('Backfill company metadata does not match');
+    const from = value('Period From'), to = value('Period To');
+    for (const date of [from, to]) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date.startsWith('0000-') || !Number.isFinite(Date.parse(date))
+            || new Date(date).toISOString().slice(0, 10) !== date) throw new Error('Invalid backfill export period');
+    }
+    if (from > to) throw new Error('Backfill export period is reversed');
+    return { from, to };
+}
+
+export async function backfillOrders(config: appConfig, guids: string[], apply = false, options: BackfillLogOptions & { masterId?: string } = {}) {
     const diagnostics = new BackfillDiagnostics({ ...options, secrets: [...(options.secrets || []), config.database.password || ''] });
     diagnostics.log(`Starting ${apply ? 'APPLY' : 'PREVIEW'} for ${guids.length} requested voucher(s).`);
     try {
@@ -26,9 +43,15 @@ export async function backfillOrders(config: appConfig, guids: string[], apply =
         throw new Error('Order backfill requires PostgreSQL and an explicit company');
     }
     const definition = yaml.load(fs.readFileSync(config.tally.definition, 'utf8')) as { transaction: tableConfigYAML[] };
-    const sourceTable = definition.transaction.find(table => table.name === 'trn_voucher');
-    if (!sourceTable) throw new Error('No voucher definition');
+    const candidates = Array.isArray(definition?.transaction) ? definition.transaction.filter(table => table?.name === 'trn_voucher') : [];
+    if (candidates.length !== 1) throw new Error('Select exactly one voucher definition');
+    const sourceTable = candidates[0];
     const table = backfillDefinition(sourceTable, guids);
+    if (options.masterId !== undefined && (guids.length !== 1 || !/^[1-9]\d{0,9}$/.test(options.masterId))) {
+        throw new Error('--master-id requires exactly one GUID and a valid Tally MasterID (not AlterID)');
+    }
+    const report = options.masterId === undefined ? generateXMLfromYAML(table)
+        : directOrderReport(generateXMLfromYAML(table), options.masterId);
     diagnostics.log('Export definition validated. Acquiring PostgreSQL import lock...');
     return await withOrderImportLock(config.database, async () => {
         diagnostics.log('Import lock acquired. Connecting to PostgreSQL...');
@@ -40,24 +63,20 @@ export async function backfillOrders(config: appConfig, guids: string[], apply =
             diagnostics.log('Connected. Checking order columns and company metadata...');
             await checkOrderSchema(client, config.tally.company);
             const metadata = await client.query("select name,value from public.config where name in ('Company Name','Period From','Period To')");
-            const values = Object.fromEntries(metadata.rows.map(row => [row.name, row.value]));
-            if (values['Company Name'] !== config.tally.company
-                || !/^\d{4}-\d{2}-\d{2}$/.test(values['Period From'] || '')
-                || !/^\d{4}-\d{2}-\d{2}$/.test(values['Period To'] || '')) {
-                throw new Error('Backfill requires existing matching company and period metadata');
-            }
-            diagnostics.log(`Schema/company checks passed. Export period: ${values['Period From']} to ${values['Period To']}. Building GUID-filtered TDL...`);
-            const request = dropUnresolvedStaticVariables(substituteTDLParameters(generateXMLfromYAML(table),
+            const period = backfillPeriod(metadata.rows, config.tally.company);
+            diagnostics.log(`Schema/company checks passed. Export period: ${period.from} to ${period.to}. Lookup: ${options.masterId === undefined ? 'GUID-filtered collection' : 'direct MasterID ' + options.masterId}.`);
+            const request = dropUnresolvedStaticVariables(substituteTDLParameters(report,
                 new Map<string, string>([['targetCompany', config.tally.company],
-                    ['fromDate', values['Period From'].replaceAll('-', '')],
-                    ['toDate', values['Period To'].replaceAll('-', '')]])));
+                    ['fromDate', period.from.replaceAll('-', '')],
+                    ['toDate', period.to.replaceAll('-', '')]])));
             const transport = new HttpTallyTransport(config.tally, undefined, {
                 progress: event => diagnostics.log(`HTTP ${JSON.stringify(event)}`),
                 partialResponse: body => diagnostics.xml('response-partial', body)
             });
-            const rows = await fetchBackfillVouchers(transport, request, table, config.tally.company, diagnostics);
+            const rows = await fetchBackfillVouchers(transport, request, table, config.tally.company, diagnostics, options.masterId !== undefined);
             if (rows.some(row => !guids.includes(row.guid))) throw new Error('Backfill returned an unrequested voucher');
             const missing = guids.filter(guid => !rows.some(row => row.guid === guid));
+            if (options.masterId !== undefined && missing.length) throw new Error('Direct lookup did not return the requested voucher; no updates applied');
             diagnostics.log(`Requested=${guids.length}; returned=${rows.length}; missing=${missing.length}.`);
             if (!apply) {
                 diagnostics.log('Checking stored revisions for preview; no order data will be written.');
