@@ -526,6 +526,17 @@ program.command('voucher-orders')
     const { backfillOrders } = await import('./order-backfill.mjs');
     console.log(JSON.stringify(await backfillOrders(config, options.guids.split(',').map(value => value.trim()), options.apply, { debugXml: options.debugXml }), null, 2));
 });
+program.command('voucher-diagnose')
+    .description('Read-only Tally timing probes; saves XML and timings, never updates PostgreSQL or Frappe')
+    .requiredOption('--guid <guid>', 'one voucher GUID')
+    .requiredOption('--from <date>', 'export start date YYYY-MM-DD')
+    .requiredOption('--to <date>', 'export end date YYYY-MM-DD')
+    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count', 'all')
+    .option('--master-id <id>', 'Tally MasterID for standalone direct lookup, NOT AlterID')
+    .action(async (options) => {
+    const { diagnoseVoucher } = await import('./voucher-diagnostics.mjs');
+    console.log(JSON.stringify(await diagnoseVoucher(loadConfig().tally, options), null, 2));
+});
 program.command('setup')
     .description('Create or update config.json with a guided wizard')
     .action(runSetupCommand);
