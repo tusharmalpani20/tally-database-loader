@@ -43,7 +43,8 @@ export class BackfillDiagnostics {
 }
 
 export async function fetchBackfillVouchers(transport: TallyTransport, request: string,
-    table: tableConfigYAML, company: string, diagnostics: BackfillDiagnostics, direct = false) {
+    table: tableConfigYAML, company: string, diagnostics: BackfillDiagnostics, direct = false,
+    parseResponse?: (xml: string) => ReturnType<typeof parseOrderVouchers>) {
     diagnostics.xml('request', request);
     diagnostics.log(`Sending Tally export (${Buffer.byteLength(request, 'utf8')} UTF-8 bytes). Waiting for the request lock or Tally response...`);
     const heartbeat = setInterval(() => diagnostics.log('Still waiting for the request lock or Tally response; no order-data updates have started.'), 15000);
@@ -62,12 +63,13 @@ export async function fetchBackfillVouchers(transport: TallyTransport, request: 
         if (['LINEERROR', 'ERROR', 'EXCEPTIONS'].includes(name)) errorTag = true;
     }
     diagnostics.log(`Received ${Buffer.byteLength(response, 'utf8')} UTF-8 bytes. XML tag names (up to 40): ${[...names].join(', ') || '(none)'}`);
-    diagnostics.log(`Expected markers: KEEXPORTCOUNT=${count}, KECOMPANY=${companyTag}; voucher tags=${vouchers}; Tally error tag=${errorTag}`);
+    if (parseResponse) diagnostics.log('Validating dedicated one-voucher protocol: source identity, eligibility and counted orders; no global collection count required.');
+    else diagnostics.log(`Expected markers: KEEXPORTCOUNT=${count}, KECOMPANY=${companyTag}; voucher tags=${vouchers}; Tally error tag=${errorTag}`);
     // Capture before validation so an unexpected/error response is available for diagnosis.
     diagnostics.xml('response', response);
     diagnostics.log('Validating response structure, company, voucher identities and order lists...');
     try {
-        const rows = parseOrderVouchers(response, table, company, direct);
+        const rows = parseResponse ? parseResponse(response) : parseOrderVouchers(response, table, company, direct);
         diagnostics.log(`Response validated: ${rows.length} voucher(s).`);
         return rows;
     } catch (error) {
