@@ -51,7 +51,11 @@ export async function backfillOrders(config: appConfig, guids: string[], apply =
                 new Map<string, string>([['targetCompany', config.tally.company],
                     ['fromDate', values['Period From'].replaceAll('-', '')],
                     ['toDate', values['Period To'].replaceAll('-', '')]])));
-            const rows = await fetchBackfillVouchers(new HttpTallyTransport(config.tally), request, table, config.tally.company, diagnostics);
+            const transport = new HttpTallyTransport(config.tally, undefined, {
+                progress: event => diagnostics.log(`HTTP ${JSON.stringify(event)}`),
+                partialResponse: body => diagnostics.xml('response-partial', body)
+            });
+            const rows = await fetchBackfillVouchers(transport, request, table, config.tally.company, diagnostics);
             if (rows.some(row => !guids.includes(row.guid))) throw new Error('Backfill returned an unrequested voucher');
             const missing = guids.filter(guid => !rows.some(row => row.guid === guid));
             diagnostics.log(`Requested=${guids.length}; returned=${rows.length}; missing=${missing.length}.`);

@@ -28,7 +28,7 @@ export class BackfillDiagnostics {
         (this.options.write || (value => console.error(value)))(line);
     }
 
-    xml(kind: 'request' | 'response', content: string): void {
+    xml(kind: 'request' | 'response' | 'response-partial', content: string): void {
         if (!this.options.debugXml) return;
         if (!this.directory) {
             const root = path.resolve(this.options.debugRoot || 'backfill-debug');

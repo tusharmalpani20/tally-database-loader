@@ -31,8 +31,22 @@ export interface TallyTransport {
     post(xml: string): Promise<string>;
 }
 
+export interface TransportDiagnostics {
+    timeoutMs?: number;
+    progress?: (event: { phase: string; elapsedMs: number; bytes?: number; status?: number }) => void;
+    partialResponse?: (body: string) => void;
+}
+
 export class HttpTallyTransport implements TallyTransport {
-    constructor(private readonly config: tallyConfig, private readonly metrics?: MetricsSink) { }
+    constructor(private readonly config: tallyConfig, private readonly metrics?: MetricsSink,
+        private readonly diagnostics: TransportDiagnostics = {}) {
+        if (diagnostics.timeoutMs !== undefined && (!Number.isSafeInteger(diagnostics.timeoutMs) || diagnostics.timeoutMs <= 0 || diagnostics.timeoutMs > 2147483647)) throw new Error('Invalid request timeout');
+    }
+
+    private reportDiagnostic(action: () => void): void {
+        // Logging/disk failures must not escape socket callbacks and leave a request unsettled.
+        try { action(); } catch { console.error('Unable to write Tally transport diagnostic output.'); }
+    }
 
     /**
      * Emits one `tally_request` metric per call with lock wait, time-to-first-byte and request
@@ -42,19 +56,25 @@ export class HttpTallyTransport implements TallyTransport {
     async post(msg: string): Promise<string> {
         const startedAt = Date.now();
         let lockWaitMs = 0;
+        this.reportDiagnostic(() => this.diagnostics.progress?.({ phase: 'lock_wait', elapsedMs: 0 }));
+        const queueTimer = this.diagnostics.progress ? setInterval(() => this.reportDiagnostic(() =>
+            this.diagnostics.progress?.({ phase: 'lock_wait', elapsedMs: Date.now() - startedAt })), 15000) : undefined;
+        queueTimer?.unref();
         try {
             const response = await withTallyLock(
                 this.config.server,
                 this.config.port,
                 'tally export',
                 () => this.postUnlocked(msg),
-                waitMs => { lockWaitMs = waitMs; }
+                waitMs => { if (queueTimer) clearInterval(queueTimer); lockWaitMs = waitMs; this.reportDiagnostic(() => this.diagnostics.progress?.({ phase: 'lock_acquired', elapsedMs: waitMs })); }
             );
             this.recordRequest(msg, startedAt, lockWaitMs, true, undefined, response);
             return response;
         } catch (err) {
             this.recordRequest(msg, startedAt, lockWaitMs, false, err);
             throw err;
+        } finally {
+            if (queueTimer) clearInterval(queueTimer);
         }
     }
 
@@ -86,6 +106,14 @@ export class HttpTallyTransport implements TallyTransport {
             this.lastTtfbMs = undefined;
             let settled = false;
             let hardCap: NodeJS.Timeout | undefined;
+            let progressTimer: NodeJS.Timeout | undefined;
+            let data = '';
+            let bytes = 0;
+            let phase = 'connecting';
+            const emit = (next: string, status?: number) => {
+                phase = next;
+                this.reportDiagnostic(() => this.diagnostics.progress?.({ phase, elapsedMs: Date.now() - requestStartedAt, bytes, status }));
+            };
             const settle = (fn: () => void) => {
                 if (settled) {
                     return; //a destroyed request emits both a timeout and an error
@@ -94,6 +122,7 @@ export class HttpTallyTransport implements TallyTransport {
                 if (hardCap) {
                     clearTimeout(hardCap);
                 }
+                if (progressTimer) clearInterval(progressTimer);
                 fn();
             };
 
@@ -109,21 +138,32 @@ export class HttpTallyTransport implements TallyTransport {
                     }
                 },
                     (res) => {
-                        let data = '';
+                        emit('response_headers', res.statusCode);
                         res
                             .setEncoding('utf16le')
                             .on('data', (chunk) => {
+                                bytes += Buffer.byteLength(chunk, 'utf16le');
+                                data += chunk.toString() || '';
                                 if (this.lastTtfbMs == undefined) {
                                     this.lastTtfbMs = Date.now() - requestStartedAt;
+                                    emit('first_body_chunk');
                                 }
-                                data += chunk.toString() || '';
+                                phase = 'receiving_body';
                             })
                             .on('end', () => {
-                                settle(() => resolve(data));
+                                settle(() => {
+                                    emit('response_complete');
+                                    if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+                                        this.reportDiagnostic(() => this.diagnostics.partialResponse?.(data));
+                                        reject(new Error(`Tally HTTP status ${res.statusCode}`));
+                                    } else resolve(data);
+                                });
                             })
                             .on('error', (httpErr) => {
                                 settle(() => {
-                                    logger.logMessage('Unable to connect with Tally. Ensure tally XML port is enabled');
+                                    this.reportDiagnostic(() => this.diagnostics.partialResponse?.(data));
+                                    emit('response_error');
+                                    logger.logMessage('Tally response failed before completion.');
                                     logger.logError('tally.postTallyXML()', httpErr['message'] || '');
                                     reject(httpErr);
                                 });
@@ -131,17 +171,29 @@ export class HttpTallyTransport implements TallyTransport {
                     });
                 req.on('error', (reqError) => {
                     settle(() => {
-                        logger.logMessage('Unable to connect with Tally. Ensure tally XML port is enabled');
+                        this.reportDiagnostic(() => this.diagnostics.partialResponse?.(data));
+                        emit('request_error');
+                        logger.logMessage('Tally HTTP request failed; see the specific error below.');
                         logger.logError('tally.postTallyXML()', reqError['message'] || '');
                         reject(reqError);
                     });
                 });
-                req.setTimeout(tallyRequestTimeoutMs(), () => {
+                req.on('socket', socket => {
+                    socket.once('lookup', error => emit(error ? 'dns_error' : 'dns_resolved'));
+                    socket.once('connect', () => emit('tcp_connected'));
+                });
+                req.once('finish', () => emit('request_sent_waiting_for_response'));
+                emit('connecting');
+                if (this.diagnostics.progress) {
+                    progressTimer = setInterval(() => emit(phase), 15000);
+                    progressTimer.unref();
+                }
+                req.setTimeout(this.diagnostics.timeoutMs ?? tallyRequestTimeoutMs(), () => {
                     req.destroy(new Error('Tally request timed out'));
                 });
                 hardCap = setTimeout(() => {
-                    req.destroy(new Error(`Tally request exceeded ${tallyRequestMaxMs()}ms`));
-                }, tallyRequestMaxMs());
+                    req.destroy(new Error(`Tally request exceeded ${this.diagnostics.timeoutMs ?? tallyRequestMaxMs()}ms`));
+                }, this.diagnostics.timeoutMs ?? tallyRequestMaxMs());
                 hardCap.unref();
                 req.write(msg, 'utf16le');
                 req.end();
