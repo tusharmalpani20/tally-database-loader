@@ -584,13 +584,14 @@ program.command('voucher-orders')
     .requiredOption('--guids <guids>', 'comma-separated list of 1–50 voucher GUIDs')
     .option('--apply', 'write revision-matched order details to PostgreSQL', false)
     .option('--master-id <id>', 'direct lookup for exactly one GUID using its Tally MasterID, NOT AlterID')
+    .option('--company-guid <guid>', 'explicit expected source company GUID, required for direct backfill')
     .option('--debug-xml', 'save private request/response XML under backfill-debug for troubleshooting', false)
-    .action(async (options: { guids: string; apply: boolean; debugXml: boolean; masterId?: string }) => {
+    .action(async (options: { guids: string; apply: boolean; debugXml: boolean; masterId?: string; companyGuid?: string }) => {
         const config = loadConfig();
         const errors = validateConfig(config);
         if (errors.length) throw new Error(errors.join('; '));
         const { backfillOrders } = await import('./order-backfill.mjs');
-        console.log(JSON.stringify(await backfillOrders(config, options.guids.split(',').map(value => value.trim()), options.apply, { debugXml: options.debugXml, masterId: options.masterId }), null, 2));
+        console.log(JSON.stringify(await backfillOrders(config, options.guids.split(',').map(value => value.trim()), options.apply, { debugXml: options.debugXml, masterId: options.masterId, companyGuid: options.companyGuid }), null, 2));
     });
 
 program.command('voucher-diagnose')
@@ -598,8 +599,9 @@ program.command('voucher-diagnose')
     .requiredOption('--guid <guid>', 'one voucher GUID')
     .requiredOption('--from <date>', 'export start date YYYY-MM-DD')
     .requiredOption('--to <date>', 'export end date YYYY-MM-DD')
-    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count, direct-orders, company-metadata', 'all')
+    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count, direct-orders, company-metadata; opt-in: direct-safe, batch-empty, batch-one', 'all')
     .option('--master-id <id>', 'Tally MasterID for standalone direct lookup, NOT AlterID')
+    .option('--company-guid <guid>', 'explicit expected source company GUID for direct-safe and batch probes')
     .action(async options => {
         const { diagnoseVoucher } = await import('./voucher-diagnostics.mjs');
         console.log(JSON.stringify(await diagnoseVoucher(loadConfig().tally, options), null, 2));

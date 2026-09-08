@@ -5,8 +5,11 @@ import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { HttpTallyTransport } from './tally-transport.mjs';
 import { generateXMLfromYAML, substituteTDLParameters } from './yaml-report-exporter.mjs';
 import { parseOrderVouchers, validateOrderDetails } from './order-details.mjs';
+import { directOrderRequest, parseDirectOrderResponse } from './direct-order-protocol.mjs';
+import { batchOrderProbe, inspectBatchOrderProbe } from './batch-order-probe.mjs';
 export const DIAGNOSTIC_TIMEOUT_MS = 3600000;
-export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata'];
+export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata', 'direct-safe', 'batch-empty', 'batch-one'];
+const gatedCases = ['direct-safe', 'batch-empty', 'batch-one'];
 function replaceOnce(xml, anchor, replacement) {
     if (xml.split(anchor).length !== 2)
         throw new Error(`Diagnostic template requires exactly one ${anchor}`);
@@ -19,6 +22,10 @@ function date(value) {
     return value.replaceAll('-', '');
 }
 export function diagnosticRequest(config, table, options, selected) {
+    if (gatedCases.includes(selected)) {
+        const scope = { ...options, company: config.company, companyGuid: options.companyGuid || '', masterId: options.masterId || '' };
+        return selected === 'direct-safe' ? directOrderRequest(scope, table) : batchOrderProbe(scope, table, selected === 'batch-empty');
+    }
     if (!config.company || !/^[a-zA-Z0-9-]{1,64}$/.test(options.guid))
         throw new Error('Explicit company and one valid GUID are required');
     if (options.masterId !== undefined && !/^[1-9]\d{0,9}$/.test(options.masterId))
@@ -136,7 +143,8 @@ export async function diagnoseVoucher(config, options) {
     log(`READ-ONLY diagnostics; no PostgreSQL/Frappe access. One-hour HTTP limit PER TEST. Artifacts: ${directory}`);
     log('XML contains private business data. Stop scheduled exports first; tests run sequentially and stop on first failure.');
     const results = [];
-    const selected = options.case === 'all' ? [...DIAGNOSTIC_CASES] : [options.case];
+    // Candidate protocols require explicit source binding and deliberate selection.
+    const selected = options.case === 'all' ? DIAGNOSTIC_CASES.filter(name => !gatedCases.includes(name)) : [options.case];
     for (const name of selected) {
         if (['direct', 'direct-orders', 'company-metadata'].includes(name) && !options.masterId) {
             log(`SKIP ${name}: no MasterID was returned by guid probe.`);
@@ -157,7 +165,20 @@ export async function diagnoseVoucher(config, options) {
             });
             const body = await transport.post(request);
             save(`${name}-response.xml`, body);
-            const details = inspectDiagnosticResponse(body, name, options.guid, config.company, options.masterId);
+            let details;
+            if (gatedCases.includes(name)) {
+                const scope = { ...options, company: config.company, companyGuid: options.companyGuid, masterId: options.masterId };
+                if (name === 'direct-safe') {
+                    const voucher = parseDirectOrderResponse(body, scope);
+                    details = { masterId: scope.masterId, order_details: voucher.order_details };
+                }
+                else {
+                    inspectBatchOrderProbe(body, scope, name === 'batch-empty');
+                    details = {};
+                }
+            }
+            else
+                details = inspectDiagnosticResponse(body, name, options.guid, config.company, options.masterId);
             if (name === 'count')
                 parseOrderVouchers(body, table, config.company);
             if (name === 'guid' && details.masterId)

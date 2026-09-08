@@ -12,7 +12,7 @@ import { logger } from '../dist/logger.mjs';
 
 const table = yaml.load(fs.readFileSync('tally-export-config-focused-incremental.yaml', 'utf8')).transaction[0];
 const config = { company: 'Fixture & Co', server: '127.0.0.1', port: 9000 };
-const options = { guid: 'fixture-guid', from: '2024-04-01', to: '2027-03-31', case: 'all', masterId: '42' };
+const options = { guid: 'fixture-guid', from: '2024-04-01', to: '2027-03-31', case: 'all', masterId: '42', companyGuid: '11111111-2222-3333-4444-555555555555' };
 
 test('all probes produce export-only XML with the same explicit company/period', () => {
     assert.equal(DIAGNOSTIC_TIMEOUT_MS, 3600000);

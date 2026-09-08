@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import yaml from 'js-yaml';
 import { Client } from 'pg';
-import { directOrderReport } from './order-details.mjs';
+import { directOrderRequest, parseDirectOrderResponse, validateDirectOrderIdentity } from './direct-order-protocol.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
 import { applyOrderBackfill, checkOrderSchema, withOrderImportLock } from './order-store.mjs';
 import { BackfillDiagnostics, fetchBackfillVouchers } from './backfill-diagnostics.mjs';
@@ -50,8 +50,11 @@ export async function backfillOrders(config, guids, apply = false, options = {})
         if (options.masterId !== undefined && (guids.length !== 1 || !/^[1-9]\d{0,9}$/.test(options.masterId))) {
             throw new Error('--master-id requires exactly one GUID and a valid Tally MasterID (not AlterID)');
         }
-        const report = options.masterId === undefined ? generateXMLfromYAML(table)
-            : directOrderReport(generateXMLfromYAML(table), options.masterId);
+        if (options.masterId !== undefined)
+            validateDirectOrderIdentity({ company: config.tally.company, companyGuid: options.companyGuid || '',
+                guid: guids[0], masterId: options.masterId });
+        else if (options.companyGuid !== undefined)
+            throw new Error('--company-guid requires --master-id');
         diagnostics.log('Export definition validated. Acquiring PostgreSQL import lock...');
         return await withOrderImportLock(config.database, async () => {
             diagnostics.log('Import lock acquired. Connecting to PostgreSQL...');
@@ -62,17 +65,24 @@ export async function backfillOrders(config, guids, apply = false, options = {})
                 await client.connect();
                 diagnostics.log('Connected. Checking order columns and company metadata...');
                 await checkOrderSchema(client, config.tally.company);
-                const metadata = await client.query("select name,value from public.config where name in ('Company Name','Period From','Period To')");
+                const metadata = await client.query("select name,value from public.config where name in ('Company Name','Company GUID','Period From','Period To')");
                 const period = backfillPeriod(metadata.rows, config.tally.company);
+                const bindings = metadata.rows.filter(row => row.name === 'Company GUID');
+                if (options.masterId !== undefined && (bindings.length > 1 || (bindings.length === 1
+                    && String(bindings[0].value).toLowerCase() !== options.companyGuid.toLowerCase()))) {
+                    throw new Error('Direct backfill company GUID does not match stored source binding');
+                }
+                const scope = options.masterId === undefined ? undefined : { company: config.tally.company,
+                    companyGuid: options.companyGuid, guid: guids[0], masterId: options.masterId, ...period };
                 diagnostics.log(`Schema/company checks passed. Export period: ${period.from} to ${period.to}. Lookup: ${options.masterId === undefined ? 'GUID-filtered collection' : 'direct MasterID ' + options.masterId}.`);
-                const request = dropUnresolvedStaticVariables(substituteTDLParameters(report, new Map([['targetCompany', config.tally.company],
+                const request = scope ? directOrderRequest(scope, sourceTable) : dropUnresolvedStaticVariables(substituteTDLParameters(generateXMLfromYAML(table), new Map([['targetCompany', config.tally.company],
                     ['fromDate', period.from.replaceAll('-', '')],
                     ['toDate', period.to.replaceAll('-', '')]])));
                 const transport = new HttpTallyTransport(config.tally, undefined, {
                     progress: event => diagnostics.log(`HTTP ${JSON.stringify(event)}`),
                     partialResponse: body => diagnostics.xml('response-partial', body)
                 });
-                const rows = await fetchBackfillVouchers(transport, request, table, config.tally.company, diagnostics, options.masterId !== undefined);
+                const rows = await fetchBackfillVouchers(transport, request, table, config.tally.company, diagnostics, false, scope ? body => [parseDirectOrderResponse(body, scope)] : undefined);
                 if (rows.some(row => !guids.includes(row.guid)))
                     throw new Error('Backfill returned an unrequested voucher');
                 const missing = guids.filter(guid => !rows.some(row => row.guid === guid));
@@ -81,13 +91,16 @@ export async function backfillOrders(config, guids, apply = false, options = {})
                 diagnostics.log(`Requested=${guids.length}; returned=${rows.length}; missing=${missing.length}.`);
                 if (!apply) {
                     diagnostics.log('Checking stored revisions for preview; no order data will be written.');
-                    const stored = await client.query('select guid,alterid from public.trn_voucher where guid=any($1::text[])', [guids]);
+                    const stored = await client.query('select guid,alterid,order_details,order_number from public.trn_voucher where guid=any($1::text[])', [guids]);
                     return { mode: 'preview', missing, vouchers: rows.map(row => ({ guid: row.guid,
                             alterid: row.alterid, order_details: row.order_details, order_number: row.order_number,
+                            stored: stored.rows.filter(value => value.guid === row.guid),
                             revision_matches: stored.rows.filter(value => value.guid === row.guid && value.alterid === row.alterid).length === 1 })) };
                 }
                 diagnostics.log('Applying only order columns where GUID and AlterID match, in one transaction...');
-                const result = await applyOrderBackfill(client, rows, config.tally.company);
+                const result = await applyOrderBackfill(client, rows, config.tally.company, scope?.companyGuid);
+                if (scope && result.updated !== 1)
+                    throw new Error('Direct backfill did not update exactly one revision-matched voucher; target is missing or has a different AlterID');
                 diagnostics.log(`Committed: updated=${result.updated}; skipped=${result.skipped.length}; missing=${missing.length}. No Frappe import or reconciliation was triggered.`);
                 return { mode: 'apply', missing, ...result };
             }

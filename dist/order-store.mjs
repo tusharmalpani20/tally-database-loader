@@ -148,7 +148,18 @@ export async function publishVoucherHeaders(client, table, data, removed = [], b
         throw error;
     }
 }
-export async function applyOrderBackfill(client, rows, company) {
+export async function checkOrderCompanyGuid(client, expected) {
+    if (!/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(expected))
+        throw new Error('Invalid expected company GUID');
+    const binding = await client.query("select value from public.config where name='Company GUID'");
+    // Older mirrors have no persistent binding; the explicit CLI source pin is
+    // still mandatory for direct export. Never silently overwrite an existing one.
+    if (binding.rows.length > 1 || (binding.rows.length === 1
+        && String(binding.rows[0].value).toLowerCase() !== expected.toLowerCase())) {
+        throw new Error('Company GUID does not match stored source binding');
+    }
+}
+export async function applyOrderBackfill(client, rows, company, companyGuid) {
     assertOrderImportLock();
     const seen = new Set();
     for (const row of rows) {
@@ -163,6 +174,8 @@ export async function applyOrderBackfill(client, rows, company) {
     await client.query('begin');
     try {
         await checkOrderSchema(client, company);
+        if (companyGuid !== undefined)
+            await checkOrderCompanyGuid(client, companyGuid);
         for (const row of rows) {
             assertOrderImportLock();
             const result = await client.query(`update public.trn_voucher

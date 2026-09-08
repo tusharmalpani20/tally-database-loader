@@ -6,11 +6,14 @@ import type { tallyConfig, tableConfigYAML } from './definition.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
 import { generateXMLfromYAML, substituteTDLParameters } from './yaml-report-exporter.mjs';
 import { parseOrderVouchers, validateOrderDetails } from './order-details.mjs';
+import { directOrderRequest, parseDirectOrderResponse } from './direct-order-protocol.mjs';
+import { batchOrderProbe, inspectBatchOrderProbe } from './batch-order-probe.mjs';
 
 export const DIAGNOSTIC_TIMEOUT_MS = 3600000;
-export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata'] as const;
+export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata', 'direct-safe', 'batch-empty', 'batch-one'] as const;
 type Case = typeof DIAGNOSTIC_CASES[number];
-interface Options { guid: string; from: string; to: string; case: string; masterId?: string }
+interface Options { guid: string; from: string; to: string; case: string; masterId?: string; companyGuid?: string }
+const gatedCases = ['direct-safe', 'batch-empty', 'batch-one'];
 
 function replaceOnce(xml: string, anchor: string, replacement: string): string {
     if (xml.split(anchor).length !== 2) throw new Error(`Diagnostic template requires exactly one ${anchor}`);
@@ -24,6 +27,10 @@ function date(value: string): string {
 }
 
 export function diagnosticRequest(config: tallyConfig, table: tableConfigYAML, options: Options, selected: Case): string {
+    if (gatedCases.includes(selected)) {
+        const scope = { ...options, company: config.company, companyGuid: options.companyGuid || '', masterId: options.masterId || '' };
+        return selected === 'direct-safe' ? directOrderRequest(scope, table) : batchOrderProbe(scope, table, selected === 'batch-empty');
+    }
     if (!config.company || !/^[a-zA-Z0-9-]{1,64}$/.test(options.guid)) throw new Error('Explicit company and one valid GUID are required');
     if (options.masterId !== undefined && !/^[1-9]\d{0,9}$/.test(options.masterId)) throw new Error('Invalid --master-id; use the Tally MasterID, not AlterID');
     const from = date(options.from), to = date(options.to);
@@ -119,7 +126,8 @@ export async function diagnoseVoucher(config: tallyConfig, options: Options) {
     log(`READ-ONLY diagnostics; no PostgreSQL/Frappe access. One-hour HTTP limit PER TEST. Artifacts: ${directory}`);
     log('XML contains private business data. Stop scheduled exports first; tests run sequentially and stop on first failure.');
     const results: object[] = [];
-    const selected = options.case === 'all' ? [...DIAGNOSTIC_CASES] : [options.case as Case];
+    // Candidate protocols require explicit source binding and deliberate selection.
+    const selected = options.case === 'all' ? DIAGNOSTIC_CASES.filter(name => !gatedCases.includes(name)) : [options.case as Case];
     for (const name of selected) {
         if (['direct', 'direct-orders', 'company-metadata'].includes(name) && !options.masterId) {
             log(`SKIP ${name}: no MasterID was returned by guid probe.`);
@@ -140,7 +148,14 @@ export async function diagnoseVoucher(config: tallyConfig, options: Options) {
             });
             const body = await transport.post(request);
             save(`${name}-response.xml`, body);
-            const details = inspectDiagnosticResponse(body, name, options.guid, config.company, options.masterId);
+            let details: { masterId?: string; order_details?: unknown };
+            if (gatedCases.includes(name)) {
+                const scope = { ...options, company: config.company, companyGuid: options.companyGuid!, masterId: options.masterId! };
+                if (name === 'direct-safe') {
+                    const voucher = parseDirectOrderResponse(body, scope);
+                    details = { masterId: scope.masterId, order_details: voucher.order_details };
+                } else { inspectBatchOrderProbe(body, scope, name === 'batch-empty'); details = {}; }
+            } else details = inspectDiagnosticResponse(body, name, options.guid, config.company, options.masterId);
             if (name === 'count') parseOrderVouchers(body, table, config.company);
             if (name === 'guid' && details.masterId) options = { ...options, masterId: details.masterId };
             results.push({ case: name, status: 'completed', elapsedMs: Date.now() - started, ...details, events });

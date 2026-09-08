@@ -1,5 +1,11 @@
 # Single-voucher order backfill
 
+**Superseded implementation note:** the ObjectEx/company-root path described below
+failed remote validation and is no longer used by direct backfill. See
+[the current release gates and commands](order-protocol-release-gates.md).
+Direct backfill now requires an explicit `--company-guid`; do not run these
+historical commands without following the new read-only gates.
+
 The shared counted report now exports a company-root metadata line and explodes
 the voucher part beneath it. This replaces sibling metadata/voucher parts that
 the September 8 remote responses demonstrated could omit company/count output.
