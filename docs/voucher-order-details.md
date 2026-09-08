@@ -144,6 +144,43 @@ by Git. Without this option, raw XML is not saved by the backfill diagnostics.
 Logging does not repair the missing-count response or relax validation; a malformed
 response still stops the command before order-data writes.
 
+### Missing-count export fix
+
+The captured request exposed a JavaScript replacement-string bug: inserted `$$`
+TDL functions became single-dollar method references. XML insertion now uses
+replacement callbacks, preserving `$$NumItems`, `$$IsEmpty` and the date functions.
+Runtime company substitution also preserves literal dollar signs.
+
+Metadata now has its own Part and a Line repeated over the selected Company,
+separate from the voucher repetition. The company field reads that Company's
+`$Name`; its Line has an explicit `KEMETADATA` XML tag. This uses Tally's documented
+[Line XML Tag structure](https://help.tallysolutions.com/line-definition-attributes/)
+and [collection-count function](https://help.tallysolutions.com/reports-and-printing-in-tdl/).
+The expected response begins like this (values are illustrative):
+
+```xml
+<ENVELOPE>
+  <KEMETADATA>
+    <KEEXPORTCOUNT>1</KEEXPORTCOUNT>
+    <KECOMPANY>Example Company</KECOMPANY>
+  </KEMETADATA>
+  <!-- KEVOUCHER rows follow, each with KEORDERCOUNT and its KEORDER children. -->
+</ENVELOPE>
+```
+
+The parser accepts this metadata section and the earlier flat metadata shape, but
+rejects missing, duplicate, conflicting or wrong-company metadata. A counted zero
+voucher response still requires the company metadata. Blank order counts are not
+silently treated as zero. No validation has been bypassed to accept the failed export.
+
+The re-check also added strict envelope/metadata/voucher/order shapes, so an unexpected
+wrapper cannot hide rows behind a zero count. Required template insertion points must
+occur exactly once; missing or duplicated anchors fail before a request is sent.
+
+Generated-expression and parser tests cover this correction, but a new Windows
+Tally preview is still required to confirm the actual report rendering. This change
+does not optimize the voucher scan or guarantee a shorter export time.
+
 ## Tests
 
 `npm test` builds and runs the unit suite. The PostgreSQL integration test is opt-in

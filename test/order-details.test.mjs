@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import yaml from 'js-yaml';
 import { XMLValidator } from 'fast-xml-parser';
-import { parseOrderVouchers, parseVoucherIdentities, resolveOrderNumber, validateOrderDetails } from '../dist/order-details.mjs';
-import { generateXMLfromYAML, withAdditionalFilters } from '../dist/yaml-report-exporter.mjs';
+import { addOrderDetailReport, parseOrderVouchers, parseVoucherIdentities, resolveOrderNumber, validateOrderDetails } from '../dist/order-details.mjs';
+import { generateXMLfromYAML, substituteTDLParameters, withAdditionalFilters } from '../dist/yaml-report-exporter.mjs';
 import { backfillDefinition } from '../dist/order-backfill.mjs';
 import { csvColumns, copyStatement } from '../dist/postgres-columns.mjs';
 
@@ -31,6 +31,64 @@ test('structured report fetches voucher order list without modifying installed i
     assert.doesNotMatch(xml, /<ID>DB Voucher Inventory Lines/);
 });
 
+test('final backfill request preserves every TDL function and literal company substitution', () => {
+    const company = 'Fixture $$ & $& Co';
+    const request = substituteTDLParameters(generateXMLfromYAML(backfillDefinition(table, ['fixture-guid'])),
+        new Map([['targetCompany', company], ['fromDate', '20240401'], ['toDate', '20270331']]));
+    assert.equal(XMLValidator.validate(request), true);
+    for (const expression of ['$$NumItems:MyCollection', '$$NumItems:InvoiceOrderList',
+        '$$IsEmpty:$BasicOrderDate', '$$YearOfDate:$BasicOrderDate',
+        '$$MonthOfDate:$BasicOrderDate', '$$DayOfDate:$BasicOrderDate', '$$IsEqual:$Name:##SVCurrentCompany']) {
+        assert.ok(request.includes(expression), `TDL expression was corrupted: ${expression}`);
+    }
+    assert.doesNotMatch(request, /(?<!\$)\$(?:NumItems|IsEmpty|YearOfDate|MonthOfDate|DayOfDate|IsEqual):/);
+    assert.ok(request.includes('<SVCURRENTCOMPANY>Fixture $$ &amp; $&amp; Co</SVCURRENTCOMPANY>'));
+    assert.match(request, /<PARTS>KEMetadataPart,MyPart<\/PARTS>/);
+    assert.match(request, /<REPEAT>KEExportCount : KEMetadataCompany<\/REPEAT>/);
+    assert.match(request, /<LINE NAME="KEExportCount"><XMLTAG>KEMETADATA<\/XMLTAG>/);
+    assert.match(request, /<FIELD NAME="KECompany"><SET>\$Name<\/SET>/);
+    assert.doesNotMatch(request, /<LINES>KEExportCount,MyLine<\/LINES>/);
+});
+
+test('nested company metadata validates zero, one and multiple vouchers without weakening count checks', () => {
+    const metadata = '<KEMETADATA><KEEXPORTCOUNT>1</KEEXPORTCOUNT><KECOMPANY>Fixture</KECOMPANY></KEMETADATA>';
+    const xml = response().replace('<KEEXPORTCOUNT>1</KEEXPORTCOUNT>', metadata);
+    assert.equal(parseOrderVouchers(xml, table, 'Fixture')[0].order_number, 'KE-SO-00018-26-27');
+    assert.deepEqual(parseVoucherIdentities(`<ENVELOPE>${metadata.replace('COUNT>1', 'COUNT>0')}</ENVELOPE>`, 'Fixture'), []);
+    const rows = '<KEVOUCHER><F01>one</F01><F02>1</F02></KEVOUCHER><KEVOUCHER><F01>two</F01><F02>2</F02></KEVOUCHER>';
+    assert.equal(parseVoucherIdentities(`<ENVELOPE>${metadata.replace('COUNT>1', 'COUNT>2')}${rows}</ENVELOPE>`, 'Fixture').length, 2);
+    for (const bad of [xml.replace('COUNT>1', 'COUNT>0'), xml.replace('Fixture', 'Wrong'),
+        xml.replace(metadata, metadata + metadata), xml.replace(metadata, metadata + '<KECOMPANY>Fixture</KECOMPANY>'),
+        xml.replace(metadata, ''), xml.replace('<KEORDERCOUNT>1</KEORDERCOUNT>', '<KEORDERCOUNT/>')]) {
+        assert.throws(() => parseOrderVouchers(bad, table, 'Fixture'));
+    }
+});
+
+test('unexpected wrappers cannot hide vouchers behind a zero count', () => {
+    const metadata = '<KEEXPORTCOUNT>0</KEEXPORTCOUNT><KECOMPANY>Fixture</KECOMPANY>';
+    const row = '<KEVOUCHER><F01>one</F01><F02>1</F02></KEVOUCHER>';
+    for (const xml of [
+        `<ENVELOPE><KEMETADATA>${metadata}${row}</KEMETADATA></ENVELOPE>`,
+        `<ENVELOPE>${metadata}<UNEXPECTED>${row}</UNEXPECTED></ENVELOPE>`,
+        `<ENVELOPE>${metadata}unexplained text</ENVELOPE>`
+    ]) assert.throws(() => parseVoucherIdentities(xml, 'Fixture'), /Unexpected/);
+});
+
+test('unexpected order wrappers cannot be interpreted as an empty order list', () => {
+    const hiddenOrder = '<WRAPPER><KEORDER><KEORDERNUMBER>SO-1</KEORDERNUMBER><KEORDERDATE/></KEORDER></WRAPPER>';
+    assert.throws(() => parseOrderVouchers(response([]).replace('</KEVOUCHER>', hiddenOrder + '</KEVOUCHER>'), table), /Unexpected/);
+    assert.throws(() => parseOrderVouchers(response().replace('</KEORDER>', '<UNKNOWN>data</UNKNOWN></KEORDER>'), table), /Unexpected/);
+});
+
+test('missing or duplicate insertion anchors fail before an incomplete TDL request can be sent', () => {
+    const base = generateXMLfromYAML({ ...table, order_details: false });
+    for (const anchor of ['<REPORT NAME="TallyDatabaseLoaderReport">', '<PARTS>MyPart</PARTS>',
+        '<LINE NAME="MyLine"><FIELDS>', '</TDLMESSAGE>']) {
+        assert.throws(() => addOrderDetailReport(base.replace(anchor, ''), table), /exactly one/);
+        assert.throws(() => addOrderDetailReport(base.replace(anchor, anchor + anchor), table), /exactly one/);
+    }
+});
+
 test('known challan extracts the voucher-level order number and date', () => {
     const [row] = parseOrderVouchers(response(), table);
     assert.equal(row.guid, 'fixture-guid');
@@ -50,6 +108,8 @@ test('voucher deletion scan is counted and company-checked without exporting ord
     const request = generateXMLfromYAML(identityTable);
     assert.equal(XMLValidator.validate(request), true);
     assert.match(request, /KEEXPORTCOUNT/);
+    assert.ok(request.includes('$$NumItems:MyCollection'));
+    assert.match(request, /<PARTS>KEMetadataPart,MyPart<\/PARTS>/);
     assert.doesNotMatch(request, /<EXPLODE>/);
     const row = '<KEVOUCHER><F01>fixture</F01><F02>10</F02></KEVOUCHER>';
     const xml = `<ENVELOPE><KECOMPANY>Fixture</KECOMPANY><KEEXPORTCOUNT>1</KEEXPORTCOUNT>${row}</ENVELOPE>`;

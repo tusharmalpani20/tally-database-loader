@@ -201,7 +201,7 @@ export function substituteTDLParameters(msg: string, substitutions: Map<string, 
     substitutions.forEach((v, k) => {
         const regPtrn = new RegExp(`\\{${k}\\}`);
         if (typeof v === 'string')
-            retval = retval.replace(regPtrn, utility.String.escapeHTML(v));
+            retval = retval.replace(regPtrn, () => utility.String.escapeHTML(v));
         else if (typeof v === 'number')
             retval = retval.replace(regPtrn, v.toString());
         else if (v instanceof Date)

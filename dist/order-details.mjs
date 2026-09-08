@@ -37,6 +37,23 @@ function scalar(object, name) {
     }
     return object[name].trim();
 }
+function assertStructure(value, allowed, context) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+        || Object.keys(value).some(key => key !== '#text' && !allowed.includes(key))) {
+        throw new Error(`Unexpected ${context} structure`);
+    }
+    const text = value['#text'];
+    if (text !== undefined && (typeof text !== 'string' || text.trim()))
+        throw new Error(`Unexpected ${context} text`);
+}
+function insertOnce(xml, anchor, replacement) {
+    const position = xml.indexOf(anchor);
+    if (position < 0 || xml.indexOf(anchor, position + anchor.length) >= 0) {
+        throw new Error(`Voucher report template must contain exactly one ${anchor}`);
+    }
+    // A callback is essential: replacement strings consume $$, $&, $` and $'.
+    return xml.replace(anchor, () => replacement);
+}
 // A counted collection distinguishes a genuinely empty list from missing extraction.
 // Keep this separate from the legacy tag-stripping scalar exporter.
 function countedVoucherRows(xml, expectedCompany) {
@@ -48,11 +65,24 @@ function countedVoucherRows(xml, expectedCompany) {
         ignoreAttributes: true, isArray: name => ['KEVOUCHER', 'KEORDER'].includes(name.toUpperCase()),
         transformTagName: name => name.toUpperCase() }).parse(xml);
     const envelope = parsed.ENVELOPE;
-    if (!envelope || typeof envelope !== 'object' || !('KEEXPORTCOUNT' in envelope)) {
+    if (!envelope || typeof envelope !== 'object') {
         throw new Error('Missing voucher export completeness count');
     }
-    const count = scalar(envelope, 'KEEXPORTCOUNT');
-    if (expectedCompany !== undefined && (!expectedCompany || scalar(envelope, 'KECOMPANY') !== expectedCompany)) {
+    // New reports export metadata as a separate, company-backed repeated line.
+    // Accept the earlier flat layout too, but never accept absent/ambiguous metadata.
+    const metadata = envelope.KEMETADATA ?? envelope;
+    if (Array.isArray(metadata))
+        throw new Error('Ambiguous voucher export metadata');
+    if (typeof metadata !== 'object' || !('KEEXPORTCOUNT' in metadata))
+        throw new Error('Missing voucher export completeness count');
+    assertStructure(envelope, ['KEMETADATA', 'KEEXPORTCOUNT', 'KECOMPANY', 'KEVOUCHER'], 'voucher envelope');
+    if (metadata !== envelope)
+        assertStructure(metadata, ['KEEXPORTCOUNT', 'KECOMPANY'], 'voucher metadata');
+    if (envelope.KEMETADATA && ('KEEXPORTCOUNT' in envelope || 'KECOMPANY' in envelope)) {
+        throw new Error('Ambiguous voucher export metadata');
+    }
+    const count = scalar(metadata, 'KEEXPORTCOUNT');
+    if (expectedCompany !== undefined && (!expectedCompany || scalar(metadata, 'KECOMPANY') !== expectedCompany)) {
         throw new Error('Voucher export company does not match the requested company');
     }
     if (!/^\d+$/.test(count))
@@ -65,6 +95,7 @@ function countedVoucherRows(xml, expectedCompany) {
 export function parseVoucherIdentities(xml, expectedCompany) {
     const seen = new Set();
     return countedVoucherRows(xml, expectedCompany).map(row => {
+        assertStructure(row, ['F01', 'F02', 'FLDBLANK'], 'voucher identity');
         const guid = scalar(row, 'F01');
         const alterid = scalar(row, 'F02');
         if (!guid || seen.has(guid) || /[\t\r\n]/.test(guid) || !/^\d+$/.test(alterid)
@@ -78,6 +109,8 @@ export function parseOrderVouchers(xml, table, expectedCompany) {
     const rows = countedVoucherRows(xml, expectedCompany);
     const seen = new Set();
     return rows.map((row) => {
+        assertStructure(row, ['KEORDERCOUNT', 'KEORDER', 'FLDBLANK',
+            ...table.fields.map((_, index) => `F${String(index + 1).padStart(2, '0')}`)], 'voucher row');
         const values = table.fields.map((_, index) => scalar(row, `F${String(index + 1).padStart(2, '0')}`));
         const guid = values[table.fields.findIndex(field => field.name === 'guid')];
         const revision = values[table.fields.findIndex(field => field.name === 'alterid')];
@@ -90,10 +123,10 @@ export function parseOrderVouchers(xml, table, expectedCompany) {
         if (!/^\d+$/.test(orderCount) || !Array.isArray(orders) || orders.length !== Number(orderCount)) {
             throw new Error('Voucher order collection count mismatch');
         }
-        const details = orders.map(entry => ({
-            order_number: scalar(entry, 'KEORDERNUMBER'),
-            order_date: orderDate(scalar(entry, 'KEORDERDATE'))
-        }));
+        const details = orders.map(entry => {
+            assertStructure(entry, ['KEORDERNUMBER', 'KEORDERDATE'], 'voucher order');
+            return { order_number: scalar(entry, 'KEORDERNUMBER'), order_date: orderDate(scalar(entry, 'KEORDERDATE')) };
+        });
         validateOrderDetails(details);
         const number = resolveOrderNumber(details);
         values[table.fields.findIndex(field => field.name === 'order_details')] = JSON.stringify(details);
@@ -112,9 +145,9 @@ export function addOrderDetailReport(xml, table) {
         .every(name => table.fields.some(field => field.name === name))) {
         throw new Error('Order details require a trn_voucher definition with identity and destination fields');
     }
-    return addCountedVoucherReport(xml)
-        .replace('<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><FIELDS>', '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><EXPLODE>KEOrders : Yes</EXPLODE><FIELDS>KEOrderCount,')
-        .replace('</TDLMESSAGE>', `
+    xml = addCountedVoucherReport(xml);
+    xml = insertOnce(xml, '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><FIELDS>', '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><EXPLODE>KEOrders : Yes</EXPLODE><FIELDS>KEOrderCount,');
+    return insertOnce(xml, '</TDLMESSAGE>', `
 <FIELD NAME="KEOrderCount"><SET>$$NumItems:InvoiceOrderList</SET><XMLTAG>KEORDERCOUNT</XMLTAG></FIELD>
 <PART NAME="KEOrders"><LINES>KEOrderLine</LINES><REPEAT>KEOrderLine : InvoiceOrderList</REPEAT></PART>
 <LINE NAME="KEOrderLine"><XMLTAG>KEORDER</XMLTAG><FIELDS>KEOrderNumber,KEOrderDate</FIELDS></LINE>
@@ -123,13 +156,15 @@ export function addOrderDetailReport(xml, table) {
 </TDLMESSAGE>`);
 }
 function addCountedVoucherReport(xml) {
-    return xml
-        .replace('<REPORT NAME="TallyDatabaseLoaderReport">', '<REPORT NAME="TallyDatabaseLoaderReport"><EXPORTEMPTYFIELDS>Yes</EXPORTEMPTYFIELDS>')
-        .replace('<LINES>MyLine</LINES>', '<LINES>KEExportCount,MyLine</LINES>')
-        .replace('<LINE NAME="MyLine"><FIELDS>', '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><FIELDS>')
-        .replace('</TDLMESSAGE>', `
-<LINE NAME="KEExportCount"><FIELDS>KEExportCountField,KECompany</FIELDS></LINE>
-<FIELD NAME="KECompany"><SET>##SVCURRENTCOMPANY</SET><XMLTAG>KECOMPANY</XMLTAG></FIELD>
+    xml = insertOnce(xml, '<REPORT NAME="TallyDatabaseLoaderReport">', '<REPORT NAME="TallyDatabaseLoaderReport"><EXPORTEMPTYFIELDS>Yes</EXPORTEMPTYFIELDS>');
+    xml = insertOnce(xml, '<PARTS>MyPart</PARTS>', '<PARTS>KEMetadataPart,MyPart</PARTS>');
+    xml = insertOnce(xml, '<LINE NAME="MyLine"><FIELDS>', '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><FIELDS>');
+    return insertOnce(xml, '</TDLMESSAGE>', `
+<PART NAME="KEMetadataPart"><LINES>KEExportCount</LINES><REPEAT>KEExportCount : KEMetadataCompany</REPEAT></PART>
+<LINE NAME="KEExportCount"><XMLTAG>KEMETADATA</XMLTAG><FIELDS>KEExportCountField,KECompany</FIELDS></LINE>
+<COLLECTION NAME="KEMetadataCompany"><TYPE>Company</TYPE><FETCH>Name</FETCH><FILTER>KEMetadataCurrentCompany</FILTER></COLLECTION>
+<SYSTEM TYPE="Formulae" NAME="KEMetadataCurrentCompany">$$IsEqual:$Name:##SVCurrentCompany</SYSTEM>
+<FIELD NAME="KECompany"><SET>$Name</SET><XMLTAG>KECOMPANY</XMLTAG></FIELD>
 <FIELD NAME="KEExportCountField"><SET>$$NumItems:MyCollection</SET><XMLTAG>KEEXPORTCOUNT</XMLTAG></FIELD>
 </TDLMESSAGE>`);
 }
