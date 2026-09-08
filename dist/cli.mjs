@@ -532,7 +532,7 @@ program.command('voucher-diagnose')
     .requiredOption('--guid <guid>', 'one voucher GUID')
     .requiredOption('--from <date>', 'export start date YYYY-MM-DD')
     .requiredOption('--to <date>', 'export end date YYYY-MM-DD')
-    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count', 'all')
+    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count, direct-orders, company-metadata', 'all')
     .option('--master-id <id>', 'Tally MasterID for standalone direct lookup, NOT AlterID')
     .action(async (options) => {
     const { diagnoseVoucher } = await import('./voucher-diagnostics.mjs');

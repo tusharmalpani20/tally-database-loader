@@ -51,6 +51,36 @@ test('diagnostics verify returned identity before accepting timing results or di
     assert.throws(() => inspectDiagnosticResponse('<ENVELOPE><F01>other</F01><KEVOUCHER><F01>fixture-guid</F01></KEVOUCHER></ENVELOPE>', 'guid', 'fixture-guid', config.company), /Ambiguous/);
 });
 
+test('minimal order and metadata probes isolate the unverified production hierarchy', () => {
+    const xml = diagnosticRequest(config, table, options, 'direct-orders');
+    assert.equal(XMLValidator.validate(xml), true);
+    assert.match(xml, /<OBJECT>Voucher : "ID:42"<\/OBJECT>/);
+    assert.match(xml, /\$\$NumItems:InvoiceOrderList/);
+    assert.match(xml, /\$BasicPurchaseOrderNo/);
+    assert.doesNotMatch(xml, /OBJECTEX|TOPPARTS|TOPLINES|KEMetadata|<COLLECTION/);
+    const metadata = diagnosticRequest(config, table, options, 'company-metadata');
+    assert.equal(XMLValidator.validate(metadata), true);
+    assert.match(metadata, /<PARTS>MyPart<\/PARTS>/);
+    assert.match(metadata, /<TYPE>Company<\/TYPE>/);
+    assert.ok(metadata.includes('If $$IsEmpty:$Guid:Voucher:"ID:42" Then "0" Else "1"'));
+    assert.doesNotMatch(metadata, /<EXPLODE>|<TYPE>Voucher<\/TYPE>/);
+    for (const name of ['direct-orders', 'company-metadata']) {
+        assert.throws(() => diagnosticRequest(config, table, { ...options, masterId: undefined }, name), /master-id/);
+    }
+});
+
+test('minimal probes validate identity, counted order lists and company-context results', () => {
+    const xml = '<ENVELOPE><F01>fixture-guid</F01><F02>1855152</F02><F03>42</F03><KEORDERCOUNT>1</KEORDERCOUNT><KEORDER><KEORDERNUMBER>KE-SO-00018-26-27</KEORDERNUMBER><KEORDERDATE>20260902</KEORDERDATE></KEORDER></ENVELOPE>';
+    const inspect = body => inspectDiagnosticResponse(body, 'direct-orders', options.guid, config.company, '42');
+    assert.deepEqual(inspect(xml), { masterId: '42', order_details: [{ order_number: 'KE-SO-00018-26-27', order_date: '2026-09-02' }] });
+    for (const bad of [xml.replace('F03>42', 'F03>43'), xml.replace('fixture-guid', 'wrong'),
+        xml.replace('COUNT>1', 'COUNT>0'), xml.replace('20260902', '20260230'),
+        xml.replace('<KEORDERCOUNT>1</KEORDERCOUNT>', ''), '<ENVELOPE></ENVELOPE>']) assert.throws(() => inspect(bad));
+    const company = '<ENVELOPE><F01>Fixture &amp; Co</F01><F02>1</F02></ENVELOPE>';
+    assert.deepEqual(inspectDiagnosticResponse(company, 'company-metadata', options.guid, config.company), {});
+    assert.throws(() => inspectDiagnosticResponse(company.replace('F02>1', 'F02>0'), 'company-metadata', options.guid, config.company));
+});
+
 test('diagnostic configuration rejects invalid ports before reading a profile or making requests', async () => {
     await assert.rejects(diagnoseVoucher({ ...config, port: 65536 }, options), /server\/port/);
     assert.throws(() => new HttpTallyTransport(config, undefined, { timeoutMs: 2147483648 }), /timeout/);

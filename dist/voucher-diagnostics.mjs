@@ -4,9 +4,14 @@ import yaml from 'js-yaml';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { HttpTallyTransport } from './tally-transport.mjs';
 import { generateXMLfromYAML, substituteTDLParameters } from './yaml-report-exporter.mjs';
-import { parseOrderVouchers } from './order-details.mjs';
+import { parseOrderVouchers, validateOrderDetails } from './order-details.mjs';
 export const DIAGNOSTIC_TIMEOUT_MS = 3600000;
-export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count'];
+export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata'];
+function replaceOnce(xml, anchor, replacement) {
+    if (xml.split(anchor).length !== 2)
+        throw new Error(`Diagnostic template requires exactly one ${anchor}`);
+    return xml.replace(anchor, () => replacement);
+}
 function date(value) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || value.startsWith('0000-') || !Number.isFinite(Date.parse(value))
         || new Date(value).toISOString().slice(0, 10) !== value)
@@ -24,9 +29,14 @@ export function diagnosticRequest(config, table, options, selected) {
     const guidFilter = `$Guid = "${options.guid}"`;
     const identity = ['Guid', 'AlterId', 'MasterID'].map((field, index) => ({ name: ['guid', 'alterid', 'master_id'][index], field, type: index ? 'number' : 'text' }));
     let definition = { ...table, order_details: false, voucher_identities: false, fetch: ['Guid,AlterId,MasterID'], fields: identity, filters: [guidFilter] };
-    if (selected === 'company')
+    if (selected === 'company' || selected === 'company-metadata')
         definition = { name: 'company', nature: 'Primary', collection: 'Company', fetch: ['Name'],
             fields: [{ name: 'company', field: 'Name', type: 'text' }], filters: ['$$IsEqual:$Name:##SVCurrentCompany'] };
+    if (['direct-orders', 'company-metadata'].includes(selected) && !options.masterId)
+        throw new Error(`${selected} requires --master-id (not AlterID)`);
+    if (selected === 'company-metadata')
+        definition.fields.push({ name: 'voucher_exists', type: 'text',
+            field: `If $$IsEmpty:$Guid:Voucher:"ID:${options.masterId}" Then "0" Else "1"` });
     if (selected === 'filters')
         definition.filters = [...(table.filters || []), guidFilter];
     if (['fields', 'orders', 'count'].includes(selected))
@@ -36,24 +46,41 @@ export function diagnosticRequest(config, table, options, selected) {
         // Diagnostic-only: retain identical layout/order extraction, remove only total collection counting.
         xml = xml.replace('$$NumItems:MyCollection', () => '"DIAGNOSTIC_COUNT_DISABLED"');
     }
-    if (selected === 'direct') {
+    if (selected === 'direct' || selected === 'direct-orders') {
         if (!/^[1-9]\d{0,9}$/.test(options.masterId || ''))
             throw new Error('Direct lookup requires --master-id from the guid test (not AlterID)');
-        xml = xml.replace('<FORMS>MyForm</FORMS>', () => `<OBJECT>Voucher : "ID:${options.masterId}"</OBJECT><FORMS>MyForm</FORMS>`)
-            .replace('<REPEAT>MyLine : MyCollection</REPEAT>', '')
-            .replace(/<COLLECTION NAME="MyCollection">[\s\S]*?<\/COLLECTION>/, '');
+        xml = replaceOnce(xml, '<FORMS>MyForm</FORMS>', `<OBJECT>Voucher : "ID:${options.masterId}"</OBJECT><FORMS>MyForm</FORMS>`);
+        xml = replaceOnce(xml, '<REPEAT>MyLine : MyCollection</REPEAT>', '');
+        const collection = xml.match(/<COLLECTION NAME="MyCollection">[\s\S]*?<\/COLLECTION>/)?.[0];
+        if (!collection)
+            throw new Error('Missing diagnostic voucher collection');
+        xml = replaceOnce(xml, collection, '');
+    }
+    if (selected === 'direct-orders') {
+        // Start with the report-level direct lookup already verified on remote Tally.
+        // Deliberately omit the production metadata hierarchy and ObjectEx binding.
+        xml = replaceOnce(xml, '<LINE NAME="MyLine"><FIELDS>', '<LINE NAME="MyLine"><EXPLODE>KEProbeOrders : Yes</EXPLODE><FIELDS>KEProbeCount,');
+        xml = replaceOnce(xml, '</TDLMESSAGE>', `
+<FIELD NAME="KEProbeCount"><SET>$$NumItems:InvoiceOrderList</SET><XMLTAG>KEORDERCOUNT</XMLTAG></FIELD>
+<PART NAME="KEProbeOrders"><LINES>KEProbeOrder</LINES><REPEAT>KEProbeOrder : InvoiceOrderList</REPEAT></PART>
+<LINE NAME="KEProbeOrder"><XMLTAG>KEORDER</XMLTAG><FIELDS>KEProbeNumber,KEProbeDate</FIELDS></LINE>
+<FIELD NAME="KEProbeNumber"><SET>$BasicPurchaseOrderNo</SET><XMLTAG>KEORDERNUMBER</XMLTAG></FIELD>
+<FIELD NAME="KEProbeDate"><SET>If $$IsEmpty:$BasicOrderDate Then "" Else (($$YearOfDate:$BasicOrderDate)*10000)+(($$MonthOfDate:$BasicOrderDate)*100)+$$DayOfDate:$BasicOrderDate</SET><XMLTAG>KEORDERDATE</XMLTAG></FIELD>
+</TDLMESSAGE>`);
     }
     return substituteTDLParameters(xml, new Map([['targetCompany', config.company], ['fromDate', from], ['toDate', to]]));
 }
-export function inspectDiagnosticResponse(body, selected, guid, company) {
+export function inspectDiagnosticResponse(body, selected, guid, company, expectedMasterId) {
     if (XMLValidator.validate(body) !== true || /<!DOCTYPE|<!ENTITY|<(?:LINEERROR|ERROR|EXCEPTIONS)(?:\s|>)/i.test(body))
         throw new Error('Invalid XML or Tally error response; inspect the saved XML');
     const root = new XMLParser({ parseTagValue: false, trimValues: true }).parse(body).ENVELOPE;
     if (!root || typeof root !== 'object' || Array.isArray(root))
         throw new Error('Missing/ambiguous response envelope');
-    if (selected === 'company') {
+    if (selected === 'company' || selected === 'company-metadata') {
         if (root.F01 !== company)
             throw new Error('Company probe did not return the configured company');
+        if (selected === 'company-metadata' && root.F02 !== '1')
+            throw new Error('Company-context voucher existence expression did not return 1');
         return {};
     }
     if (root.KEVOUCHER !== undefined && root.F01 !== undefined)
@@ -61,6 +88,26 @@ export function inspectDiagnosticResponse(body, selected, guid, company) {
     const row = root.KEVOUCHER ?? root;
     if (Array.isArray(row) || row.F01 !== guid)
         throw new Error('Response did not contain exactly the requested voucher GUID');
+    if (selected === 'direct-orders') {
+        if (!expectedMasterId || row.F03 !== expectedMasterId || typeof row.F02 !== 'string'
+            || !/^\d+$/.test(row.F02) || !Number.isSafeInteger(Number(row.F02)))
+            throw new Error('Invalid direct order probe identity');
+        if (Object.keys(root).some(key => !['F01', 'F02', 'F03', 'FLDBLANK', 'KEORDERCOUNT', 'KEORDER'].includes(key)))
+            throw new Error('Unexpected direct order probe structure');
+        const entries = row.KEORDER === undefined ? [] : Array.isArray(row.KEORDER) ? row.KEORDER : [row.KEORDER];
+        if (typeof row.KEORDERCOUNT !== 'string' || !/^\d+$/.test(row.KEORDERCOUNT) || Number(row.KEORDERCOUNT) !== entries.length)
+            throw new Error('Direct order probe count mismatch');
+        const order_details = entries.map((entry) => {
+            if (!entry || typeof entry !== 'object' || Object.keys(entry).some(key => !['KEORDERNUMBER', 'KEORDERDATE'].includes(key))
+                || typeof entry.KEORDERNUMBER !== 'string' || typeof entry.KEORDERDATE !== 'string')
+                throw new Error('Invalid direct order probe entry');
+            const raw = entry.KEORDERDATE;
+            return { order_number: entry.KEORDERNUMBER, order_date: raw === '' ? null : /^\d{8}$/.test(raw)
+                    ? `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6)}` : raw };
+        });
+        validateOrderDetails(order_details);
+        return { masterId: row.F03, order_details };
+    }
     const masterId = ['guid', 'direct', 'filters'].includes(selected) && /^[1-9]\d{0,9}$/.test(row.F03 || '') ? row.F03 : undefined;
     return { masterId };
 }
@@ -75,8 +122,8 @@ export async function diagnoseVoucher(config, options) {
         throw new Error('Select the order-detail voucher profile in config.json');
     // Validate all non-network inputs before creating artifacts or sending the company probe.
     diagnosticRequest(config, table, options, 'guid');
-    if (options.case === 'direct')
-        diagnosticRequest(config, table, options, 'direct');
+    if (options.case !== 'all')
+        diagnosticRequest(config, table, options, options.case);
     const root = path.resolve('backfill-debug');
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const directory = fs.mkdtempSync(path.join(root, 'diagnose-'));
@@ -91,8 +138,8 @@ export async function diagnoseVoucher(config, options) {
     const results = [];
     const selected = options.case === 'all' ? [...DIAGNOSTIC_CASES] : [options.case];
     for (const name of selected) {
-        if (name === 'direct' && !options.masterId) {
-            log('SKIP direct: no MasterID was returned by guid probe.');
+        if (['direct', 'direct-orders', 'company-metadata'].includes(name) && !options.masterId) {
+            log(`SKIP ${name}: no MasterID was returned by guid probe.`);
             results.push({ case: name, status: 'skipped' });
             save('summary.json', JSON.stringify(results, null, 2));
             continue;
@@ -110,7 +157,7 @@ export async function diagnoseVoucher(config, options) {
             });
             const body = await transport.post(request);
             save(`${name}-response.xml`, body);
-            const details = inspectDiagnosticResponse(body, name, options.guid, config.company);
+            const details = inspectDiagnosticResponse(body, name, options.guid, config.company, options.masterId);
             if (name === 'count')
                 parseOrderVouchers(body, table, config.company);
             if (name === 'guid' && details.masterId)
@@ -121,7 +168,7 @@ export async function diagnoseVoucher(config, options) {
         catch (error) {
             results.push({ case: name, status: 'failed', elapsedMs: Date.now() - started, error: error instanceof Error ? error.message : String(error), events });
             save('summary.json', JSON.stringify(results, null, 2));
-            log(`STOP ${name}: ${error instanceof Error ? error.message : error}. Do not immediately retry: Tally may still be processing the cancelled request.`);
+            log(`STOP ${name}: ${error instanceof Error ? error.message : error}. If the HTTP request failed before completion, check Tally is responsive before retrying.`);
             throw error;
         }
         save('summary.json', JSON.stringify(results, null, 2));

@@ -20,7 +20,9 @@ comparison. Each HTTP request has an explicit **3,600,000ms (one hour)** limit f
 both inactivity and total request time, overriding timeout environment variables
 for this command only. Normal `voucher-orders` and sync defaults are unchanged.
 The existing local-lock queue may add up to 15 minutes before an HTTP request starts.
-Seven sequential tests can take several hours; the suite stops on the first failure.
+Nine sequential tests can take several hours; the suite stops on the first failure.
+For the empty-report investigation, run the two [minimal probes](minimal-order-probes.md)
+individually instead of rerunning this full suite.
 
 | Case | What it measures |
 | --- | --- |
@@ -31,9 +33,11 @@ Seven sequential tests can take several hours; the suite stops on the first fail
 | `fields` | Production filters, header fields and fetch list, without the nested order report |
 | `orders` | Full order extraction and metadata layout, but replaces only the total voucher-count expression with a diagnostic constant |
 | `count` | Full production report, including total voucher count and production parser validation |
+| `direct-orders` | Minimal report-level MasterID binding with counted order extraction, without production metadata |
+| `company-metadata` | Minimal company report plus voucher-existence expression, without voucher repetition |
 
-`all` discovers MasterID from the `guid` response and uses it for `direct`. If no
-usable MasterID is returned, that test is recorded as skipped. MasterID is **not**
+`all` discovers MasterID from the `guid` response and uses it for the direct and
+company-metadata probes. If no usable MasterID is returned, those tests are skipped. MasterID is **not**
 AlterID; no ID is guessed from the GUID. The report-object syntax follows
 [Tally's voucher-identity documentation](https://help.tallysolutions.com/article/DeveloperReference/faq/6191.html).
 Actual compatibility and timings must be verified on the target Tally installation.
