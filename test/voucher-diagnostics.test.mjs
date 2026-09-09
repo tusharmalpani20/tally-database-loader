@@ -44,6 +44,20 @@ test('probes isolate filter cost and collection count; direct lookup uses Master
     assert.throws(() => diagnosticRequest(config, table, { ...options, masterId: 'invalid' }, 'company'), /master-id/);
 });
 
+test('normal compatibility probes exercise production counted order reports', () => {
+    const empty = diagnosticRequest(config, table, options, 'normal-empty');
+    const one = diagnosticRequest(config, table, options, 'normal-one');
+    for (const xml of [empty, one]) {
+        assert.match(xml, /<SCROLLED>Vertical<\/SCROLLED>/);
+        assert.match(xml, /<XMLTAG>KEEXPORTCOUNT<\/XMLTAG>/);
+        assert.match(xml, /<XMLTAG>KECOMPANY<\/XMLTAG>/);
+        assert.match(xml, /<XMLTAG>KEORDERNUMBER<\/XMLTAG>/);
+        assert.doesNotMatch(xml, /KE_BATCH_PROBE|<XMLATTR>/);
+    }
+    assert.match(empty, />No<\/SYSTEM>/);
+    assert.doesNotMatch(one, />No<\/SYSTEM>/);
+});
+
 test('diagnostics verify returned identity before accepting timing results or discovering a MasterID', () => {
     assert.deepEqual(inspectDiagnosticResponse('<ENVELOPE><F01>fixture-guid</F01><F02>123</F02><F03>42</F03></ENVELOPE>', 'guid', 'fixture-guid', config.company), { masterId: '42' });
     assert.throws(() => inspectDiagnosticResponse('<ENVELOPE><F01>wrong</F01></ENVELOPE>', 'guid', 'fixture-guid', config.company));
@@ -86,6 +100,17 @@ test('diagnostic configuration rejects invalid ports before reading a profile or
     assert.throws(() => new HttpTallyTransport(config, undefined, { timeoutMs: 2147483648 }), /timeout/);
 });
 
+test('diagnostics reject ambiguous voucher profiles before contacting Tally', async t => {
+    const read = fs.readFileSync;
+    t.mock.method(fs, 'readFileSync', (file, ...args) => file === 'ambiguous-profile.yaml'
+        ? yaml.dump({ transaction: [table, table] }) : read(file, ...args));
+    let requests = 0;
+    t.mock.method(HttpTallyTransport.prototype, 'post', async () => { requests++; return '<ENVELOPE/>'; });
+    await assert.rejects(diagnoseVoucher({ ...config, definition: 'ambiguous-profile.yaml' },
+        { ...options, case: 'normal-one' }), /exactly one/);
+    assert.equal(requests, 0);
+});
+
 test('runner saves responses and failure summary and stops before further probes', async t => {
     t.mock.method(console, 'error', () => {});
     const previous = process.cwd();
@@ -114,6 +139,43 @@ test('runner saves responses and failure summary and stops before further probes
         process.chdir(previous);
         server.closeAllConnections();
         await new Promise(resolve => server.close(resolve));
+        fs.rmSync(temporary, { recursive: true, force: true });
+    }
+});
+
+test('staged and normal probes validate replies and stop safely without database access', async t => {
+    t.mock.method(console, 'error', () => {});
+    const previous = process.cwd();
+    const definition = path.resolve('tally-export-config-focused-incremental.yaml');
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'voucher-stages-test-'));
+    let body = '<ENVELOPE/>';
+    let requests = 0;
+    const layout = '<ENVELOPE><PROTOCOL>KE_DIRECT_ORDERS_V1</PROTOCOL><GUID>fixture-guid</GUID><MASTERID>42</MASTERID><ALTERID>123</ALTERID><ORDERCOUNT>0</ORDERCOUNT></ENVELOPE>';
+    t.mock.method(HttpTallyTransport.prototype, 'post', async () => { requests++; return body; });
+    try {
+        process.chdir(temporary);
+        const run = name => diagnoseVoucher({ ...config, definition }, { ...options, case: name });
+        body = layout;
+        await assert.rejects(run('direct-isolate'), /COMPANY/);
+        assert.equal(requests, 2, 'must stop after source stage fails');
+        const directory = path.join('backfill-debug', fs.readdirSync('backfill-debug')[0]);
+        const summary = JSON.parse(fs.readFileSync(path.join(directory, 'summary.json'), 'utf8'));
+        assert.deepEqual(summary.map(row => [row.case, row.status]), [['direct-layout', 'completed'], ['direct-source', 'failed']]);
+        body = '<ENVELOPE><KECOMPANY>Fixture &amp; Co</KECOMPANY><KEEXPORTCOUNT>0</KEEXPORTCOUNT></ENVELOPE>';
+        assert.equal((await run('normal-empty')).results[0].status, 'completed');
+        await assert.rejects(run('normal-one'), /unexpected voucher count/);
+        const fields = table.fields.map((field, i) => {
+            const tag = `F${String(i + 1).padStart(2, '0')}`;
+            const value = field.name === 'guid' ? options.guid : field.name === 'alterid' ? '123' : '';
+            return `<${tag}>${value}</${tag}>`;
+        }).join('');
+        body = `<ENVELOPE><KECOMPANY>Fixture &amp; Co</KECOMPANY><KEEXPORTCOUNT>1</KEEXPORTCOUNT><KEVOUCHER><KEORDERCOUNT>0</KEORDERCOUNT>${fields}</KEVOUCHER></ENVELOPE>`;
+        assert.equal((await run('normal-one')).results[0].status, 'completed');
+        await assert.rejects(run('normal-empty'), /unexpected voucher count/);
+        body = '<ENVELOPE/>';
+        await assert.rejects(run('normal-empty'), /completeness count/);
+    } finally {
+        process.chdir(previous);
         fs.rmSync(temporary, { recursive: true, force: true });
     }
 });

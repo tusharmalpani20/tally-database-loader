@@ -5,11 +5,14 @@ import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { HttpTallyTransport } from './tally-transport.mjs';
 import { generateXMLfromYAML, substituteTDLParameters } from './yaml-report-exporter.mjs';
 import { parseOrderVouchers, validateOrderDetails } from './order-details.mjs';
-import { directOrderRequest, parseDirectOrderResponse } from './direct-order-protocol.mjs';
+import { directOrderStageRequest, inspectDirectOrderStage } from './direct-order-protocol.mjs';
 import { batchOrderProbe, inspectBatchOrderProbe } from './batch-order-probe.mjs';
 export const DIAGNOSTIC_TIMEOUT_MS = 3600000;
-export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata', 'direct-safe', 'batch-empty', 'batch-one'];
-const gatedCases = ['direct-safe', 'batch-empty', 'batch-one'];
+export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata', 'direct-safe', 'batch-empty', 'batch-one', 'direct-layout', 'direct-source', 'direct-isolate', 'normal-empty', 'normal-one'];
+const directCases = ['direct-layout', 'direct-source', 'direct-safe', 'direct-isolate'];
+const normalCases = ['normal-empty', 'normal-one'];
+const gatedCases = [...directCases, ...normalCases, 'batch-empty', 'batch-one'];
+const directStage = (name) => name === 'direct-layout' ? 'layout' : name === 'direct-source' ? 'source' : 'full';
 function replaceOnce(xml, anchor, replacement) {
     if (xml.split(anchor).length !== 2)
         throw new Error(`Diagnostic template requires exactly one ${anchor}`);
@@ -22,9 +25,9 @@ function date(value) {
     return value.replaceAll('-', '');
 }
 export function diagnosticRequest(config, table, options, selected) {
-    if (gatedCases.includes(selected)) {
+    if (gatedCases.includes(selected) && !normalCases.includes(selected)) {
         const scope = { ...options, company: config.company, companyGuid: options.companyGuid || '', masterId: options.masterId || '' };
-        return selected === 'direct-safe' ? directOrderRequest(scope, table) : batchOrderProbe(scope, table, selected === 'batch-empty');
+        return directCases.includes(selected) ? directOrderStageRequest(scope, table, directStage(selected)) : batchOrderProbe(scope, table, selected === 'batch-empty');
     }
     if (!config.company || !/^[a-zA-Z0-9-]{1,64}$/.test(options.guid))
         throw new Error('Explicit company and one valid GUID are required');
@@ -48,6 +51,9 @@ export function diagnosticRequest(config, table, options, selected) {
         definition.filters = [...(table.filters || []), guidFilter];
     if (['fields', 'orders', 'count'].includes(selected))
         definition = { ...table, filters: [...(table.filters || []), guidFilter], order_details: selected !== 'fields' };
+    if (normalCases.includes(selected))
+        definition = { ...table, order_details: true,
+            filters: [...(table.filters || []), guidFilter, ...(selected === 'normal-empty' ? ['No'] : [])] };
     let xml = generateXMLfromYAML(definition);
     if (selected === 'orders') {
         // Diagnostic-only: retain identical layout/order extraction, remove only total collection counting.
@@ -124,9 +130,10 @@ export async function diagnoseVoucher(config, options) {
     if (!config.server || !Number.isInteger(config.port) || config.port <= 0 || config.port > 65535)
         throw new Error('Configure a valid Tally server/port');
     const profile = yaml.load(fs.readFileSync(config.definition, 'utf8'));
-    const table = Array.isArray(profile?.transaction) ? profile.transaction.find(row => row?.name === 'trn_voucher' && row.order_details) : undefined;
-    if (!table)
-        throw new Error('Select the order-detail voucher profile in config.json');
+    const candidates = Array.isArray(profile?.transaction) ? profile.transaction.filter(row => row?.name === 'trn_voucher') : [];
+    if (candidates.length !== 1 || !candidates[0].order_details)
+        throw new Error('Select exactly one order-detail voucher definition in config.json');
+    const table = candidates[0];
     // Validate all non-network inputs before creating artifacts or sending the company probe.
     diagnosticRequest(config, table, options, 'guid');
     if (options.case !== 'all')
@@ -144,7 +151,8 @@ export async function diagnoseVoucher(config, options) {
     log('XML contains private business data. Stop scheduled exports first; tests run sequentially and stop on first failure.');
     const results = [];
     // Candidate protocols require explicit source binding and deliberate selection.
-    const selected = options.case === 'all' ? DIAGNOSTIC_CASES.filter(name => !gatedCases.includes(name)) : [options.case];
+    const selected = options.case === 'direct-isolate' ? ['direct-layout', 'direct-source', 'direct-safe']
+        : options.case === 'all' ? DIAGNOSTIC_CASES.filter(name => !gatedCases.includes(name)) : [options.case];
     for (const name of selected) {
         if (['direct', 'direct-orders', 'company-metadata'].includes(name) && !options.masterId) {
             log(`SKIP ${name}: no MasterID was returned by guid probe.`);
@@ -166,10 +174,17 @@ export async function diagnoseVoucher(config, options) {
             const body = await transport.post(request);
             save(`${name}-response.xml`, body);
             let details;
-            if (gatedCases.includes(name)) {
+            if (normalCases.includes(name)) {
+                const rows = parseOrderVouchers(body, table, config.company);
+                if (rows.length !== (name === 'normal-empty' ? 0 : 1) || rows.some(row => row.guid !== options.guid)) {
+                    throw new Error('Normal-sync probe returned an unexpected voucher count or identity');
+                }
+                details = { order_details: rows.map(row => row.order_details) };
+            }
+            else if (gatedCases.includes(name)) {
                 const scope = { ...options, company: config.company, companyGuid: options.companyGuid, masterId: options.masterId };
-                if (name === 'direct-safe') {
-                    const voucher = parseDirectOrderResponse(body, scope);
+                if (directCases.includes(name)) {
+                    const voucher = inspectDirectOrderStage(body, scope, directStage(name));
                     details = { masterId: scope.masterId, order_details: voucher.order_details };
                 }
                 else {

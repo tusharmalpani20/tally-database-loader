@@ -6,14 +6,17 @@ import type { tallyConfig, tableConfigYAML } from './definition.mjs';
 import { HttpTallyTransport } from './tally-transport.mjs';
 import { generateXMLfromYAML, substituteTDLParameters } from './yaml-report-exporter.mjs';
 import { parseOrderVouchers, validateOrderDetails } from './order-details.mjs';
-import { directOrderRequest, parseDirectOrderResponse } from './direct-order-protocol.mjs';
+import { directOrderStageRequest, inspectDirectOrderStage } from './direct-order-protocol.mjs';
 import { batchOrderProbe, inspectBatchOrderProbe } from './batch-order-probe.mjs';
 
 export const DIAGNOSTIC_TIMEOUT_MS = 3600000;
-export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata', 'direct-safe', 'batch-empty', 'batch-one'] as const;
+export const DIAGNOSTIC_CASES = ['company', 'guid', 'direct', 'filters', 'fields', 'orders', 'count', 'direct-orders', 'company-metadata', 'direct-safe', 'batch-empty', 'batch-one', 'direct-layout', 'direct-source', 'direct-isolate', 'normal-empty', 'normal-one'] as const;
 type Case = typeof DIAGNOSTIC_CASES[number];
 interface Options { guid: string; from: string; to: string; case: string; masterId?: string; companyGuid?: string }
-const gatedCases = ['direct-safe', 'batch-empty', 'batch-one'];
+const directCases = ['direct-layout', 'direct-source', 'direct-safe', 'direct-isolate'];
+const normalCases = ['normal-empty', 'normal-one'];
+const gatedCases = [...directCases, ...normalCases, 'batch-empty', 'batch-one'];
+const directStage = (name: string) => name === 'direct-layout' ? 'layout' as const : name === 'direct-source' ? 'source' as const : 'full' as const;
 
 function replaceOnce(xml: string, anchor: string, replacement: string): string {
     if (xml.split(anchor).length !== 2) throw new Error(`Diagnostic template requires exactly one ${anchor}`);
@@ -27,9 +30,9 @@ function date(value: string): string {
 }
 
 export function diagnosticRequest(config: tallyConfig, table: tableConfigYAML, options: Options, selected: Case): string {
-    if (gatedCases.includes(selected)) {
+    if (gatedCases.includes(selected) && !normalCases.includes(selected)) {
         const scope = { ...options, company: config.company, companyGuid: options.companyGuid || '', masterId: options.masterId || '' };
-        return selected === 'direct-safe' ? directOrderRequest(scope, table) : batchOrderProbe(scope, table, selected === 'batch-empty');
+        return directCases.includes(selected) ? directOrderStageRequest(scope, table, directStage(selected)) : batchOrderProbe(scope, table, selected === 'batch-empty');
     }
     if (!config.company || !/^[a-zA-Z0-9-]{1,64}$/.test(options.guid)) throw new Error('Explicit company and one valid GUID are required');
     if (options.masterId !== undefined && !/^[1-9]\d{0,9}$/.test(options.masterId)) throw new Error('Invalid --master-id; use the Tally MasterID, not AlterID');
@@ -45,6 +48,8 @@ export function diagnosticRequest(config: tallyConfig, table: tableConfigYAML, o
         field: `If $$IsEmpty:$Guid:Voucher:"ID:${options.masterId}" Then "0" Else "1"` });
     if (selected === 'filters') definition.filters = [...(table.filters || []), guidFilter];
     if (['fields', 'orders', 'count'].includes(selected)) definition = { ...table, filters: [...(table.filters || []), guidFilter], order_details: selected !== 'fields' };
+    if (normalCases.includes(selected)) definition = { ...table, order_details: true,
+        filters: [...(table.filters || []), guidFilter, ...(selected === 'normal-empty' ? ['No'] : [])] };
     let xml = generateXMLfromYAML(definition);
     if (selected === 'orders') {
         // Diagnostic-only: retain identical layout/order extraction, remove only total collection counting.
@@ -109,8 +114,9 @@ export async function diagnoseVoucher(config: tallyConfig, options: Options) {
     if (options.case !== 'all' && !(DIAGNOSTIC_CASES as readonly string[]).includes(options.case)) throw new Error(`--case must be all or ${DIAGNOSTIC_CASES.join(', ')}`);
     if (!config.server || !Number.isInteger(config.port) || config.port <= 0 || config.port > 65535) throw new Error('Configure a valid Tally server/port');
     const profile = yaml.load(fs.readFileSync(config.definition, 'utf8')) as { transaction: tableConfigYAML[] };
-    const table = Array.isArray(profile?.transaction) ? profile.transaction.find(row => row?.name === 'trn_voucher' && row.order_details) : undefined;
-    if (!table) throw new Error('Select the order-detail voucher profile in config.json');
+    const candidates = Array.isArray(profile?.transaction) ? profile.transaction.filter(row => row?.name === 'trn_voucher') : [];
+    if (candidates.length !== 1 || !candidates[0].order_details) throw new Error('Select exactly one order-detail voucher definition in config.json');
+    const table = candidates[0];
     // Validate all non-network inputs before creating artifacts or sending the company probe.
     diagnosticRequest(config, table, options, 'guid');
     if (options.case !== 'all') diagnosticRequest(config, table, options, options.case as Case);
@@ -127,7 +133,8 @@ export async function diagnoseVoucher(config: tallyConfig, options: Options) {
     log('XML contains private business data. Stop scheduled exports first; tests run sequentially and stop on first failure.');
     const results: object[] = [];
     // Candidate protocols require explicit source binding and deliberate selection.
-    const selected = options.case === 'all' ? DIAGNOSTIC_CASES.filter(name => !gatedCases.includes(name)) : [options.case as Case];
+    const selected: Case[] = options.case === 'direct-isolate' ? ['direct-layout', 'direct-source', 'direct-safe']
+        : options.case === 'all' ? DIAGNOSTIC_CASES.filter(name => !gatedCases.includes(name)) : [options.case as Case];
     for (const name of selected) {
         if (['direct', 'direct-orders', 'company-metadata'].includes(name) && !options.masterId) {
             log(`SKIP ${name}: no MasterID was returned by guid probe.`);
@@ -149,10 +156,16 @@ export async function diagnoseVoucher(config: tallyConfig, options: Options) {
             const body = await transport.post(request);
             save(`${name}-response.xml`, body);
             let details: { masterId?: string; order_details?: unknown };
-            if (gatedCases.includes(name)) {
+            if (normalCases.includes(name)) {
+                const rows = parseOrderVouchers(body, table, config.company);
+                if (rows.length !== (name === 'normal-empty' ? 0 : 1) || rows.some(row => row.guid !== options.guid)) {
+                    throw new Error('Normal-sync probe returned an unexpected voucher count or identity');
+                }
+                details = { order_details: rows.map(row => row.order_details) };
+            } else if (gatedCases.includes(name)) {
                 const scope = { ...options, company: config.company, companyGuid: options.companyGuid!, masterId: options.masterId! };
-                if (name === 'direct-safe') {
-                    const voucher = parseDirectOrderResponse(body, scope);
+                if (directCases.includes(name)) {
+                    const voucher = inspectDirectOrderStage(body, scope, directStage(name));
                     details = { masterId: scope.masterId, order_details: voucher.order_details };
                 } else { inspectBatchOrderProbe(body, scope, name === 'batch-empty'); details = {}; }
             } else details = inspectDiagnosticResponse(body, name, options.guid, config.company, options.masterId);

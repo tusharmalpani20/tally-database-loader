@@ -533,7 +533,7 @@ program.command('voucher-diagnose')
     .requiredOption('--guid <guid>', 'one voucher GUID')
     .requiredOption('--from <date>', 'export start date YYYY-MM-DD')
     .requiredOption('--to <date>', 'export end date YYYY-MM-DD')
-    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count, direct-orders, company-metadata; opt-in: direct-safe, batch-empty, batch-one', 'all')
+    .option('--case <name>', 'all, company, guid, direct, filters, fields, orders, count, direct-orders, company-metadata; opt-in: direct-isolate, direct-layout, direct-source, direct-safe, normal-empty, normal-one, batch-empty, batch-one', 'all')
     .option('--master-id <id>', 'Tally MasterID for standalone direct lookup, NOT AlterID')
     .option('--company-guid <guid>', 'explicit expected source company GUID for direct-safe and batch probes')
     .action(async (options) => {
