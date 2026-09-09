@@ -45,6 +45,7 @@ test('final backfill request preserves every TDL function and literal company su
     assert.ok(request.includes('<SVCURRENTCOMPANY>Fixture $$ &amp; $&amp; Co</SVCURRENTCOMPANY>'));
     assert.match(request, /<TOPPARTS>KEMetadataPart<\/TOPPARTS>/);
     assert.match(request, /<REPEAT>KEExportCount : KEMetadataCompany<\/REPEAT>/);
+    assert.match(request, /<PART NAME="KEMetadataPart"><TOPLINES>KEExportCount<\/TOPLINES><REPEAT>KEExportCount : KEMetadataCompany<\/REPEAT><SCROLLED>Vertical<\/SCROLLED><\/PART>/);
     assert.match(request, /<LINE NAME="KEExportCount"><FIELDS>KEExportCountField,KECompany<\/FIELDS><EXPLODE>MyPart : Yes<\/EXPLODE>/);
     assert.match(request, /<FIELD NAME="KECompany"><SET>\$Name<\/SET>/);
     assert.doesNotMatch(request, /<LINES>KEExportCount,MyLine<\/LINES>/);
@@ -155,6 +156,7 @@ test('voucher deletion scan is counted and company-checked without exporting ord
     assert.match(request, /KEEXPORTCOUNT/);
     assert.ok(request.includes('$$NumItems:MyCollection'));
     assert.match(request, /<TOPPARTS>KEMetadataPart<\/TOPPARTS>/);
+    assert.match(request, /<PART NAME="KEMetadataPart"><TOPLINES>KEExportCount<\/TOPLINES><REPEAT>KEExportCount : KEMetadataCompany<\/REPEAT><SCROLLED>Vertical<\/SCROLLED><\/PART>/);
     assert.doesNotMatch(request, /<EXPLODE>KEOrders/);
     const row = '<KEVOUCHER><F01>fixture</F01><F02>10</F02></KEVOUCHER>';
     const xml = `<ENVELOPE><KECOMPANY>Fixture</KECOMPANY><KEEXPORTCOUNT>1</KEEXPORTCOUNT>${row}</ENVELOPE>`;

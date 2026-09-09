@@ -161,10 +161,12 @@ function addCountedVoucherReport(xml) {
     xml = insertOnce(xml, '<REPORT NAME="TallyDatabaseLoaderReport">', '<REPORT NAME="TallyDatabaseLoaderReport"><EXPORTEMPTYFIELDS>Yes</EXPORTEMPTYFIELDS>');
     // Metadata must be the root of the exported hierarchy, not a sibling part
     // which Tally can omit from XML. Explode vouchers beneath the company line.
+    // Give this outer repeated part vertical scrolling too, matching the working
+    // export layout; scrolling only MyPart leaves its parent without that layout.
     xml = insertOnce(xml, '<PARTS>MyPart</PARTS>', '<TOPPARTS>KEMetadataPart</TOPPARTS>');
     xml = insertOnce(xml, '<LINE NAME="MyLine"><FIELDS>', '<LINE NAME="MyLine"><XMLTAG>KEVOUCHER</XMLTAG><FIELDS>');
     return insertOnce(xml, '</TDLMESSAGE>', `
-<PART NAME="KEMetadataPart"><TOPLINES>KEExportCount</TOPLINES><REPEAT>KEExportCount : KEMetadataCompany</REPEAT></PART>
+<PART NAME="KEMetadataPart"><TOPLINES>KEExportCount</TOPLINES><REPEAT>KEExportCount : KEMetadataCompany</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
 <LINE NAME="KEExportCount"><FIELDS>KEExportCountField,KECompany</FIELDS><EXPLODE>MyPart : Yes</EXPLODE></LINE>
 <COLLECTION NAME="KEMetadataCompany"><TYPE>Company</TYPE><FETCH>Name</FETCH><FILTER>KEMetadataCurrentCompany</FILTER></COLLECTION>
 <SYSTEM TYPE="Formulae" NAME="KEMetadataCurrentCompany">$$IsEqual:$Name:##SVCurrentCompany</SYSTEM>

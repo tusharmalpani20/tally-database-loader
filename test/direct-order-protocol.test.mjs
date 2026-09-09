@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import yaml from 'js-yaml';
 import { XMLValidator } from 'fast-xml-parser';
-import { directOrderRequest, parseDirectOrderResponse } from '../dist/direct-order-protocol.mjs';
+import { directOrderRequest, parseDirectOrderResponse, directOrderStageRequest, inspectDirectOrderStage } from '../dist/direct-order-protocol.mjs';
 import { batchOrderProbe, inspectBatchOrderProbe } from '../dist/batch-order-probe.mjs';
 import { BackfillDiagnostics, fetchBackfillVouchers } from '../dist/backfill-diagnostics.mjs';
 
@@ -25,6 +25,7 @@ test('direct contract retains proven object binding, embedded company reads and 
     const xml = directOrderRequest(scope, table);
     assert.equal(XMLValidator.validate(xml), true);
     assert.match(xml, /<EXPORTEMPTYFIELDS>Yes<\/EXPORTEMPTYFIELDS>/);
+    assert.match(xml, /<PART NAME="KEDOPart"><LINES>KEDOLine<\/LINES><SCROLLED>Vertical<\/SCROLLED>/);
     assert.match(xml, /<OBJECT>Voucher : "ID:42"<\/OBJECT>/);
     assert.match(xml, /\$GUID:Company:##SVCurrentCompany/);
     assert.match(xml, /IsCancelled/);
@@ -38,6 +39,29 @@ test('direct contract retains proven object binding, embedded company reads and 
     assert.throws(() => directOrderRequest({ ...scope, company: 'Fixture\nCompany' }, table));
     assert.throws(() => batchOrderProbe(scope, { ...table, filters: [] }, true));
     assert.throws(() => batchOrderProbe(scope, { ...table, name: 'trn_inventory' }, false));
+});
+
+test('diagnostic stages isolate fields but cannot pass full publication validation', () => {
+    assert.throws(() => directOrderStageRequest(scope, table, 'typo'), /diagnostic stage/);
+    assert.throws(() => inspectDirectOrderStage(fixture(), scope, 'typo'), /diagnostic stage/);
+    assert.equal(directOrderStageRequest(scope, table, 'full'), directOrderRequest(scope, table));
+    let source = fixture();
+    for (const tag of ['VOUCHERTYPE', 'DATE', 'CANCELLED', 'OPTIONAL', 'ELIGIBLE']) {
+        // Remove only the header's first occurrence, preserving the nested order date.
+        source = source.replace(new RegExp(`<${tag}>[^<]*</${tag}>`), '');
+    }
+    const layout = source.replace(/<(COMPANY|COMPANYGUID)>[^<]*<\/\1>/g, '');
+    for (const [stage, response] of [['layout', layout], ['source', source]]) {
+        const request = directOrderStageRequest(scope, table, stage);
+        assert.equal(XMLValidator.validate(request), true);
+        assert.doesNotMatch(request, /\$IsCancelled|\$VoucherTypeName/);
+        if (stage === 'layout') assert.doesNotMatch(request, /\$Name:Company|\$GUID:Company/);
+        else assert.match(request, /\$GUID:Company/);
+        assert.equal(inspectDirectOrderStage(response, scope, stage).order_number, 'SO-1');
+        assert.throws(() => parseDirectOrderResponse(response, scope));
+        assert.throws(() => inspectDirectOrderStage('<ENVELOPE/>', scope, stage));
+        assert.throws(() => inspectDirectOrderStage(response.replace('<MASTERID>42', '<MASTERID>43'), scope, stage));
+    }
 });
 
 test('direct response preserves zero, multiple and dated order entries', () => {

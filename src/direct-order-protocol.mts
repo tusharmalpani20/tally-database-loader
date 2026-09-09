@@ -36,10 +36,24 @@ export function validateDirectOrderScope(scope: DirectOrderScope): void {
 // Candidate protocol: preserves the remotely proven report-level direct binding.
 // Company-object reads are exported in the SAME response and must be verified live.
 export function directOrderRequest(scope: DirectOrderScope, table: tableConfigYAML): string {
+    return directOrderStageRequest(scope, table, 'full');
+}
+
+export type DirectOrderStage = 'layout' | 'source' | 'full';
+function stageFields(stage: DirectOrderStage): string[] {
+    if (!['layout', 'source', 'full'].includes(stage)) throw new Error('Invalid direct-order diagnostic stage');
+    const fields = ['PROTOCOL', 'GUID', 'MASTERID', 'ALTERID', 'ORDERCOUNT'];
+    if (stage !== 'layout') fields.push('COMPANY', 'COMPANYGUID');
+    if (stage === 'full') fields.push('VOUCHERTYPE', 'DATE', 'CANCELLED', 'OPTIONAL', 'ELIGIBLE');
+    return fields;
+}
+
+// Reduced stages are diagnostic-only; backfill always requests and validates full.
+export function directOrderStageRequest(scope: DirectOrderScope, table: tableConfigYAML, stage: DirectOrderStage): string {
     validateDirectOrderScope(scope);
     if (!table.order_details || table.name !== 'trn_voucher' || !table.filters?.length) throw new Error('Select the order-detail voucher profile with eligibility filters');
     const filters = table.filters.map(filter => `(${filter})`).join(' AND ');
-    const fields: [string, string][] = [
+    const allFields: [string, string][] = [
         ['PROTOCOL', `"${VERSION}"`], ['COMPANY', '$Name:Company:##SVCurrentCompany'],
         ['COMPANYGUID', '$GUID:Company:##SVCurrentCompany'], ['GUID', '$Guid'],
         ['MASTERID', '$$String:$MasterID'], ['ALTERID', '$$String:$AlterID'], ['VOUCHERTYPE', '$VoucherTypeName'],
@@ -47,9 +61,10 @@ export function directOrderRequest(scope: DirectOrderScope, table: tableConfigYA
         ['CANCELLED', 'If $IsCancelled Then "1" Else "0"'], ['OPTIONAL', 'If $IsOptional Then "1" Else "0"'],
         ['ELIGIBLE', `If ${filters} Then "1" Else "0"`], ['ORDERCOUNT', '$$NumItems:InvoiceOrderList']
     ];
+    const fields = allFields.filter(([tag]) => stageFields(stage).includes(tag));
     return `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>KEDirectOrdersV1</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>${escape(scope.company)}</SVCURRENTCOMPANY><SVFROMDATE>${scope.from.replaceAll('-', '')}</SVFROMDATE><SVTODATE>${scope.to.replaceAll('-', '')}</SVTODATE></STATICVARIABLES><TDL><TDLMESSAGE>
 <REPORT NAME="KEDirectOrdersV1"><EXPORTEMPTYFIELDS>Yes</EXPORTEMPTYFIELDS><OBJECT>Voucher : "ID:${scope.masterId}"</OBJECT><FORMS>KEDOForm</FORMS></REPORT>
-<FORM NAME="KEDOForm"><PARTS>KEDOPart</PARTS></FORM><PART NAME="KEDOPart"><LINES>KEDOLine</LINES></PART>
+<FORM NAME="KEDOForm"><PARTS>KEDOPart</PARTS></FORM><PART NAME="KEDOPart"><LINES>KEDOLine</LINES><SCROLLED>Vertical</SCROLLED></PART>
 <LINE NAME="KEDOLine"><FIELDS>${fields.map(([tag]) => `KEDO${tag}`).join(',')}</FIELDS><EXPLODE>KEDOOrders : Yes</EXPLODE></LINE>
 ${fields.map(([tag, expression]) => `<FIELD NAME="KEDO${tag}"><SET>${escape(expression)}</SET><XMLTAG>${tag}</XMLTAG></FIELD>`).join('\n')}
 <PART NAME="KEDOOrders"><LINES>KEDOOrder</LINES><REPEAT>KEDOOrder : InvoiceOrderList</REPEAT></PART>
@@ -75,19 +90,26 @@ function integer(row: Record<string, unknown>, key: string): number {
 }
 
 export function parseDirectOrderResponse(xml: string, scope: DirectOrderScope): OrderVoucher {
+    return inspectDirectOrderStage(xml, scope, 'full');
+}
+
+export function inspectDirectOrderStage(xml: string, scope: DirectOrderScope, stage: DirectOrderStage): OrderVoucher {
     validateDirectOrderScope(scope);
     if (/<!DOCTYPE|<!ENTITY/i.test(xml) || XMLValidator.validate(xml) !== true) throw new Error('Invalid direct-order XML');
     const document = new XMLParser({ ignoreAttributes: false, ignoreDeclaration: true, parseTagValue: false,
         trimValues: false, isArray: name => name === 'ORDER' }).parse(xml);
     structure(document, ['ENVELOPE']);
     const row = document.ENVELOPE;
-    structure(row, ['PROTOCOL', 'COMPANY', 'COMPANYGUID', 'GUID', 'MASTERID', 'ALTERID', 'VOUCHERTYPE', 'DATE', 'CANCELLED', 'OPTIONAL', 'ELIGIBLE', 'ORDERCOUNT', 'ORDER']);
-    if (scalar(row, 'PROTOCOL') !== VERSION || scalar(row, 'COMPANY') !== scope.company
-        || scalar(row, 'COMPANYGUID').toLowerCase() !== scope.companyGuid.toLowerCase()
+    structure(row, [...stageFields(stage), 'ORDER']);
+    if (scalar(row, 'PROTOCOL') !== VERSION
         || scalar(row, 'GUID') !== scope.guid || scalar(row, 'MASTERID') !== scope.masterId) throw new Error('Direct-order source or voucher identity mismatch');
-    const date = calendarDate(scalar(row, 'DATE'));
-    if (!scalar(row, 'VOUCHERTYPE') || date < scope.from || date > scope.to || scalar(row, 'CANCELLED') !== '0'
-        || scalar(row, 'OPTIONAL') !== '0' || scalar(row, 'ELIGIBLE') !== '1') throw new Error('Direct-order voucher is not eligible');
+    if (stage !== 'layout' && (scalar(row, 'COMPANY') !== scope.company
+        || scalar(row, 'COMPANYGUID').toLowerCase() !== scope.companyGuid.toLowerCase())) throw new Error('Direct-order source or voucher identity mismatch');
+    if (stage === 'full') {
+        const date = calendarDate(scalar(row, 'DATE'));
+        if (!scalar(row, 'VOUCHERTYPE') || date < scope.from || date > scope.to || scalar(row, 'CANCELLED') !== '0'
+            || scalar(row, 'OPTIONAL') !== '0' || scalar(row, 'ELIGIBLE') !== '1') throw new Error('Direct-order voucher is not eligible');
+    }
     const orders = row.ORDER ?? [];
     if (!Array.isArray(orders) || orders.length !== integer(row, 'ORDERCOUNT')) throw new Error('Direct-order list count mismatch');
     const order_details = orders.map(entry => {
