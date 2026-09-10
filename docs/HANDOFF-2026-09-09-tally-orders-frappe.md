@@ -173,7 +173,9 @@ New diagnostic modes:
 Older `batch-empty`/`batch-one` attribute-layout experiments remain available but
 are not the tests that established success here. Opt-in probes are excluded
 from `--case all`. Diagnostics have a one-hour HTTP limit per request; do not
-assume this independently changes every scheduler timeout.
+assume this independently changes every scheduler timeout. On 10 September 2026,
+the normal scheduler inactivity and absolute request defaults were also raised to
+one hour. The local Tally request-lock queue remains a separate 15-minute limit.
 
 Audit also added runtime rejection of invalid diagnostic stages and ambiguous
 profiles containing duplicate `trn_voucher` definitions.

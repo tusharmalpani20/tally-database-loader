@@ -18,7 +18,9 @@ node dist/cli.mjs voucher-diagnose --guid aac3341a-ee89-4145-9f7a-3edec7de877b-0
 The period above matches the failed request. Keep it unchanged for a controlled
 comparison. Each HTTP request has an explicit **3,600,000ms (one hour)** limit for
 both inactivity and total request time, overriding timeout environment variables
-for this command only. Normal `voucher-orders` and sync defaults are unchanged.
+for this command. Normal `voucher-orders` and scheduled sync requests also default
+to one hour; `TALLY_REQUEST_TIMEOUT_MS` and `TALLY_REQUEST_MAX_MS` can override
+their inactivity and wall-clock limits independently.
 The existing local-lock queue may add up to 15 minutes before an HTTP request starts.
 Nine sequential tests can take several hours; the suite stops on the first failure.
 For the empty-report investigation, run the two [minimal probes](minimal-order-probes.md)
