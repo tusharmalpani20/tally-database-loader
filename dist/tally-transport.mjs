@@ -10,10 +10,11 @@ import { withTallyLock } from './tally-lock.mjs';
 //previous 600000 sat close enough to that range that a cold cache, a richer fetch list or another
 //user's load tipped runs over it - which is what the "Tally request exceeded 600000ms" failures
 //were. They were never a crash or a hang: our own stopwatch was destroying a socket that would
-//have delivered. 1800000 clears the measured worst case with room to spare.
+//have delivered. One hour gives normal scheduled exports the same conservative budget as the
+//diagnostic path while retaining a finite ceiling for genuinely wedged requests.
 export function tallyRequestTimeoutMs() {
     const configured = parseInt(process.env['TALLY_REQUEST_TIMEOUT_MS'] || '', 10);
-    return Number.isFinite(configured) && configured > 0 ? configured : 1800000;
+    return Number.isFinite(configured) && configured > 0 ? configured : 3600000;
 }
 //req.setTimeout is an inactivity timeout, so on its own nothing bounds a request's wall-clock
 //time. An unbounded request outlives the lock's staleness window and ends up running beside the

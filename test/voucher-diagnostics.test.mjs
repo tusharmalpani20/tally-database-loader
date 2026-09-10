@@ -7,12 +7,28 @@ import path from 'node:path';
 import yaml from 'js-yaml';
 import { XMLValidator } from 'fast-xml-parser';
 import { diagnoseVoucher, diagnosticRequest, inspectDiagnosticResponse, DIAGNOSTIC_CASES, DIAGNOSTIC_TIMEOUT_MS } from '../dist/voucher-diagnostics.mjs';
-import { HttpTallyTransport } from '../dist/tally-transport.mjs';
+import { HttpTallyTransport, tallyRequestMaxMs, tallyRequestTimeoutMs } from '../dist/tally-transport.mjs';
 import { logger } from '../dist/logger.mjs';
 
 const table = yaml.load(fs.readFileSync('tally-export-config-focused-incremental.yaml', 'utf8')).transaction[0];
 const config = { company: 'Fixture & Co', server: '127.0.0.1', port: 9000 };
 const options = { guid: 'fixture-guid', from: '2024-04-01', to: '2027-03-31', case: 'all', masterId: '42', companyGuid: '11111111-2222-3333-4444-555555555555' };
+
+test('normal Tally requests default to a one-hour inactivity and wall-clock limit', () => {
+    const previousTimeout = process.env.TALLY_REQUEST_TIMEOUT_MS;
+    const previousMax = process.env.TALLY_REQUEST_MAX_MS;
+    try {
+        delete process.env.TALLY_REQUEST_TIMEOUT_MS;
+        delete process.env.TALLY_REQUEST_MAX_MS;
+        assert.equal(tallyRequestTimeoutMs(), 3600000);
+        assert.equal(tallyRequestMaxMs(), 3600000);
+    } finally {
+        if (previousTimeout === undefined) delete process.env.TALLY_REQUEST_TIMEOUT_MS;
+        else process.env.TALLY_REQUEST_TIMEOUT_MS = previousTimeout;
+        if (previousMax === undefined) delete process.env.TALLY_REQUEST_MAX_MS;
+        else process.env.TALLY_REQUEST_MAX_MS = previousMax;
+    }
+});
 
 test('all probes produce export-only XML with the same explicit company/period', () => {
     assert.equal(DIAGNOSTIC_TIMEOUT_MS, 3600000);
