@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import yaml from 'js-yaml';
 import { XMLValidator } from 'fast-xml-parser';
-import { addOrderDetailReport, directOrderReport, parseOrderVouchers, parseVoucherIdentities, resolveOrderNumber, validateOrderDetails } from '../dist/order-details.mjs';
+import { addOrderDetailReport, directOrderReport, normalizeOrderNumber, parseOrderVouchers, parseVoucherIdentities, resolveOrderNumber, validateOrderDetails } from '../dist/order-details.mjs';
 import { generateXMLfromYAML, substituteTDLParameters, withAdditionalFilters } from '../dist/yaml-report-exporter.mjs';
 import { backfillDefinition, backfillPeriod } from '../dist/order-backfill.mjs';
 import { csvColumns, copyStatement } from '../dist/postgres-columns.mjs';
@@ -19,6 +19,35 @@ export function response(orders = [{ order_number: 'KE-SO-00018-26-27', order_da
         + orders.map(row => `<KEORDER><KEORDERNUMBER>${escape(row.order_number)}</KEORDERNUMBER><KEORDERDATE>${row.order_date || ''}</KEORDERDATE></KEORDER>`).join('')
         + '</KEVOUCHER></ENVELOPE>';
 }
+
+test('ingestion normalizes controls and truncates Unicode order numbers with safe diagnostics', t => {
+    const warnings = [];
+    t.mock.method(console, 'warn', message => warnings.push(message));
+    const row = parseOrderVouchers(response([{ order_number: '  SO\nPRIVATE\t42  ', order_date: '' }]), table)[0];
+    assert.equal(row.order_number, 'SO PRIVATE 42');
+    assert.equal(row.order_details[0].order_number, 'SO PRIVATE 42');
+    assert.match(warnings[0], /fixture-guid/);
+    assert.match(warnings[0], /"entry":1/);
+    assert.match(warnings[0], /PRIVATE/);
+    assert.match(warnings[0], /KP\/8535\/26-27/);
+    const logged = JSON.parse(warnings[0].slice(warnings[0].indexOf('{')));
+    assert.equal(logged.originalOrderNumber, '  SO\nPRIVATE\t42  ');
+    assert.equal(logged.normalizedOrderNumber, 'SO PRIVATE 42');
+    assert.equal(warnings[0].includes('\n'), false, 'control characters must be JSON-escaped in logs');
+    assert.equal(normalizeOrderNumber('😀'.repeat(141), 'fixture', 1), '😀'.repeat(140));
+    assert.match(warnings.at(-1), /"truncatedCharacters":1/);
+    assert.equal(normalizeOrderNumber('A\u0000B\u007fC\u0085D', 'fixture', 0), 'A B C D');
+    assert.throws(() => validateOrderDetails([{ order_number: 'A\u0085B', order_date: null }]), /Invalid voucher order number/);
+    assert.equal(normalizeOrderNumber('A'.repeat(139) + ' B', 'fixture', 0), 'A'.repeat(139));
+    assert.throws(() => parseOrderVouchers(response([{ order_number: 'valid', order_date: '20260230' }]), table), /fixture-guid.*order entry 1.*date/);
+    assert.equal(normalizeOrderNumber('\n\t', 'fixture', 0), '');
+    const before = warnings.length;
+    assert.equal(normalizeOrderNumber('SO-123', 'fixture', 0), 'SO-123');
+    assert.equal(warnings.length, before);
+    const long = parseOrderVouchers(response([{ order_number: 'X'.repeat(141), order_date: '' }]), table)[0];
+    assert.equal(long.order_number, 'X'.repeat(140));
+    assert.equal(JSON.parse(long.values[table.fields.findIndex(f => f.name === 'order_details')])[0].order_number, long.order_number);
+});
 
 test('structured report fetches voucher order list without modifying installed inventory TDL', () => {
     const xml = generateXMLfromYAML(withAdditionalFilters(table, ['$AlterID <= 10']));

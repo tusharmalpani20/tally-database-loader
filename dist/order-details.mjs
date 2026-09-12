@@ -1,4 +1,21 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+// Normalize only at the Tally ingestion boundary. Publication still validates
+// staged values strictly so corrupt or manually edited data cannot bypass checks.
+export function normalizeOrderNumber(value, guid, entryIndex, context = {}) {
+    const controls = value.match(/[\u0000-\u001f\u007f-\u009f]/g)?.length || 0;
+    const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim();
+    const characters = [...cleaned];
+    const normalized = characters.slice(0, 140).join('').trimEnd();
+    if (normalized !== value) {
+        console.warn(`[voucher-orders] Normalized order number ${JSON.stringify({
+            ...context, guid, entry: entryIndex + 1, originalOrderNumber: value,
+            normalizedOrderNumber: normalized, originalCharacters: [...value].length,
+            normalizedCharacters: [...normalized].length, controlCharactersReplaced: controls,
+            truncatedCharacters: Math.max(0, characters.length - 140)
+        })}`);
+    }
+    return normalized;
+}
 export function resolveOrderNumber(details) {
     const numbers = [...new Set(details.map(row => row.order_number.trim()).filter(Boolean))];
     return numbers.length === 1 ? numbers[0] : null;
@@ -11,7 +28,7 @@ export function validateOrderDetails(value) {
     for (const entry of value) {
         if (!entry || typeof entry !== 'object' || typeof entry.order_number !== 'string'
             || entry.order_number !== entry.order_number.trim()
-            || [...entry.order_number].length > 140 || /[\u0000-\u001f\u007f]/.test(entry.order_number)) {
+            || [...entry.order_number].length > 140 || /[\u0000-\u001f\u007f-\u009f]/.test(entry.order_number)) {
             throw new Error('Invalid voucher order number');
         }
         if (entry.order_date !== null && (typeof entry.order_date !== 'string'
@@ -31,11 +48,11 @@ function orderDate(value) {
     }
     return date;
 }
-function scalar(object, name) {
+function scalar(object, name, trim = true) {
     if (!(name in object) || typeof object[name] !== 'string') {
         throw new Error(`Missing or non-scalar order export field ${name}`);
     }
-    return object[name].trim();
+    return trim ? object[name].trim() : object[name];
 }
 function assertStructure(value, allowed, context) {
     if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -125,9 +142,17 @@ export function parseOrderVouchers(xml, table, expectedCompany, direct = false) 
         if (!/^\d+$/.test(orderCount) || !Array.isArray(orders) || orders.length !== Number(orderCount)) {
             throw new Error('Voucher order collection count mismatch');
         }
-        const details = orders.map(entry => {
-            assertStructure(entry, ['KEORDERNUMBER', 'KEORDERDATE'], 'voucher order');
-            return { order_number: scalar(entry, 'KEORDERNUMBER'), order_date: orderDate(scalar(entry, 'KEORDERDATE')) };
+        const details = orders.map((entry, index) => {
+            try {
+                assertStructure(entry, ['KEORDERNUMBER', 'KEORDERDATE'], 'voucher order');
+                const order_date = orderDate(scalar(entry, 'KEORDERDATE'));
+                const context = Object.fromEntries(table.fields.map((field, i) => [field.name, values[i]])
+                    .filter(([name]) => ['alterid', 'voucher_number', 'voucher_type', 'date', 'party_name'].includes(name)));
+                return { order_number: normalizeOrderNumber(scalar(entry, 'KEORDERNUMBER', false), guid, index, { ...context, company: expectedCompany, orderDate: order_date }), order_date };
+            }
+            catch (error) {
+                throw new Error(`Voucher ${JSON.stringify(guid)} order entry ${index + 1}: ${error instanceof Error ? error.message : 'invalid order data'}`);
+            }
         });
         validateOrderDetails(details);
         const number = resolveOrderNumber(details);
