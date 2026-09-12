@@ -64,6 +64,16 @@ test('diagnostic stages isolate fields but cannot pass full publication validati
     }
 });
 
+test('direct backfill normalizes order numbers with the same ingestion policy', t => {
+    const warnings = [];
+    t.mock.method(console, 'warn', message => warnings.push(message));
+    const row = parseDirectOrderResponse(fixture(`<ORDER><NUMBER>A\t${'B'.repeat(150)}</NUMBER><DATE/></ORDER>`), scope);
+    assert.equal(row.order_number, 'A ' + 'B'.repeat(138));
+    assert.equal(row.order_details[0].order_number, row.order_number);
+    assert.match(warnings[0], /fixture-guid/);
+    assert.throws(() => parseDirectOrderResponse(fixture('<ORDER><NUMBER>valid</NUMBER><DATE>20260230</DATE></ORDER>'), scope), /fixture-guid.*order entry 1.*date/);
+});
+
 test('direct response preserves zero, multiple and dated order entries', () => {
     assert.equal(parseDirectOrderResponse(fixture(), scope).order_number, 'SO-1');
     assert.equal(parseDirectOrderResponse(fixture().replaceAll('><', '>\r\n <'), scope).order_number, 'SO-1');

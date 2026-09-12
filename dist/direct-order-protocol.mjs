@@ -1,5 +1,5 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
-import { resolveOrderNumber, validateOrderDetails } from './order-details.mjs';
+import { normalizeOrderNumber, resolveOrderNumber, validateOrderDetails } from './order-details.mjs';
 const VERSION = 'KE_DIRECT_ORDERS_V1';
 const escape = (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 function calendarDate(value) {
@@ -69,10 +69,10 @@ function structure(value, allowed) {
     if (text !== undefined && (typeof text !== 'string' || text.trim()))
         throw new Error('Unexpected direct-order response text');
 }
-function scalar(row, key) {
+function scalar(row, key, trim = true) {
     if (typeof row[key] !== 'string')
         throw new Error(`Missing or ambiguous direct-order ${key}`);
-    return row[key].trim();
+    return trim ? row[key].trim() : row[key];
 }
 function integer(row, key) {
     const value = scalar(row, key);
@@ -107,10 +107,18 @@ export function inspectDirectOrderStage(xml, scope, stage) {
     const orders = row.ORDER ?? [];
     if (!Array.isArray(orders) || orders.length !== integer(row, 'ORDERCOUNT'))
         throw new Error('Direct-order list count mismatch');
-    const order_details = orders.map(entry => {
-        structure(entry, ['NUMBER', 'DATE']);
-        const rawDate = scalar(entry, 'DATE');
-        return { order_number: scalar(entry, 'NUMBER'), order_date: rawDate ? calendarDate(rawDate) : null };
+    const order_details = orders.map((entry, index) => {
+        try {
+            structure(entry, ['NUMBER', 'DATE']);
+            const rawDate = scalar(entry, 'DATE');
+            const order_date = rawDate ? calendarDate(rawDate) : null;
+            return { order_number: normalizeOrderNumber(scalar(entry, 'NUMBER', false), scope.guid, index, { company: scope.company, companyGuid: scope.companyGuid, masterId: scope.masterId,
+                    alterid: integer(row, 'ALTERID'), voucherType: row.VOUCHERTYPE, voucherDate: row.DATE,
+                    orderDate: order_date }), order_date };
+        }
+        catch (error) {
+            throw new Error(`Voucher ${JSON.stringify(scope.guid)} order entry ${index + 1}: ${error instanceof Error ? error.message : 'invalid order data'}`);
+        }
     });
     validateOrderDetails(order_details);
     return { guid: scope.guid, alterid: integer(row, 'ALTERID'), order_details,
